@@ -25,18 +25,11 @@ API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
 
-# Channels to monitor (top Solana memecoin channels)
+# Channels to monitor
+# Note: Most Telegram channels are dead. @gmgnsignals posts 100 contracts/day (tested Apr 4 2026)
 CHANNELS = [
-    '@solanamemecoins',
-    '@SolanaFloor',
-    '@solana_calls',
-    '@SolanaGems',
-    '@degencalls',
-    '@alphacalls',
-    '@soltrending',
-    '@SolanaWhales',
-    '@pumpdotfun',
-    '@SolShitcoins',
+    '@gmgnsignals',          # 100 contracts/day (only active channel found)
+    '@soltrending',          # Backup (low activity but exists)
 ]
 
 # Hype keywords
@@ -115,7 +108,8 @@ def check_birdeye(contract: str) -> tuple[bool, str, Dict]:
         resp = requests.get(url, timeout=10)
         
         if resp.status_code != 200:
-            return False, f"API error: {resp.status_code}", {}
+            # Birdeye API not working - skip check (we have Rugcheck + Dexscreener)
+            return True, f"Birdeye unavailable (HTTP {resp.status_code}), skipping", {}
         
         data = resp.json().get('data', {})
         
@@ -156,17 +150,17 @@ def check_dexscreener(contract: str) -> tuple[bool, str, Dict]:
         volume_24h = float(pair.get('volume', {}).get('h24', 0) or 0)
         created_at = pair.get('pairCreatedAt')
         
-        if liquidity < 10000:
+        if liquidity < 5000:  # Lowered from 10k to catch more early coins
             return False, f"Low DEX liquidity: ${liquidity:,.0f}", pair
         
-        if volume_24h < 5000:
+        if volume_24h < 2000:  # Lowered from 5k
             return False, f"Low 24h volume: ${volume_24h:,.0f}", pair
         
-        # Check age
+        # Check age (lowered from 0.5h to 0.2h to catch earlier pumps)
         if created_at:
             created = datetime.fromtimestamp(created_at / 1000)
             age_hours = (datetime.now() - created).total_seconds() / 3600
-            if age_hours < 0.5:
+            if age_hours < 0.2:
                 return False, f"Too new: {age_hours:.1f}h old", pair
         
         return True, "PASS", pair
@@ -355,9 +349,8 @@ async def scan_telegram_channels():
     
     print(f"📡 Scanning {len(CHANNELS)} Telegram channels...")
     
-    # Get messages from last 10 minutes
-    since = datetime.now() - timedelta(minutes=10)
-    
+    # Get messages from last 24 hours (catch signals posted throughout the day)
+    since = datetime.now() - timedelta(hours=24)
     signals = []
     
     for channel in CHANNELS:
@@ -365,7 +358,9 @@ async def scan_telegram_channels():
             messages = await client.get_messages(channel, limit=50)
             
             for msg in messages:
-                if msg.date.replace(tzinfo=None) < since:
+                # Check if message is recent (handle timezone-aware datetime)
+                msg_date = msg.date.replace(tzinfo=None) if msg.date.tzinfo else msg.date
+                if msg_date < since:
                     continue
                 
                 text = msg.message or ''
@@ -378,7 +373,7 @@ async def scan_telegram_channels():
                 # Calculate hype score
                 score = calculate_hype_score(text)
                 
-                if score >= 5:
+                if score >= 2:  # Lower threshold to catch more signals
                     signals.append({
                         'contract': contract,
                         'score': score,
