@@ -495,16 +495,16 @@ async def main():
         
         dex_pass, dex_msg, dex_data = check_dexscreener(contract)
         if not dex_pass:
-            print(f\"  ❌ Dexscreener: {dex_msg}\")
-            log_rejection(contract, f\"Dexscreener: {dex_msg}\", signal)
+            print(f"  ❌ Dexscreener: {dex_msg}")
+            log_rejection(contract, f"Dexscreener: {dex_msg}", signal)
             continue
-        print(f\"  ✅ Dexscreener: {dex_msg}\")
+        print(f"  ✅ Dexscreener: {dex_msg}")
         
         # Get entry price
         price = get_current_price(contract)
         if not price:
-            print(f\"  ❌ Could not fetch price\")
-            log_rejection(contract, \"Price unavailable\", signal)
+            print(f"  ❌ Could not fetch price")
+            log_rejection(contract, "Price unavailable", signal)
             continue
         
         # Collect market data for ANALYSIS
