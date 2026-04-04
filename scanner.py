@@ -43,9 +43,9 @@ REJECTIONS_LOG = BASE_DIR / 'logs' / 'rejections.jsonl'
 POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 
 # Paper trading state
-PAPER_BALANCE = 10000.0
-POSITION_SIZE_PCT = 0.10  # 10% per trade (was 5%) - more aggressive
-MAX_POSITIONS = 5  # 5 concurrent (was 3)
+PAPER_BALANCE = 100.0  # $100 total (realistic small account)
+POSITION_SIZE = 10.0  # $10 per trade (fixed size)
+MAX_POSITIONS = 5  # 5 concurrent
 
 
 def extract_contract_address(text: str) -> Optional[str]:
@@ -201,14 +201,15 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
     # Check position limits
     open_count = len([p for p in positions if p['status'] == 'OPEN'])
     if open_count >= MAX_POSITIONS:
-        log_rejection(contract, "Max positions reached", signal_data)
+        print(f"⚠️  Max positions ({MAX_POSITIONS}) reached, skipping")
         return
     
-    # Calculate position size
+    # Get balance
     with open(BASE_DIR / 'data' / 'balance.txt') as f:
         balance = float(f.read().strip())
     
-    size = balance * POSITION_SIZE_PCT
+    # Fixed position size
+    size = POSITION_SIZE  # $10 fixed
     
     position = {
         'contract': contract,
