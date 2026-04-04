@@ -217,8 +217,9 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
         'entry_price': entry_price,
         'entry_time': datetime.now().isoformat(),
         'size_usd': size,
-        'target_price': entry_price * 1.5,  # 50% profit (was 100%) - quicker exits
-        'stop_loss': entry_price * 0.5,  # -50% stop (was -30%) - riskier
+        'initial_stop': entry_price * 0.70,  # -30% initial stop (tight on rugs)
+        'trailing_stop': None,  # Activated once profitable
+        'peak_price': entry_price,  # Track highest price for trailing
         'status': 'OPEN',
         'signal_data': signal_data
     }
@@ -236,7 +237,7 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
 
 
 def check_exits():
-    """Check all open positions for exit conditions"""
+    """Check all open positions for exit conditions with TRAILING STOPS"""
     positions = load_positions()
     
     for pos in positions:
@@ -249,16 +250,42 @@ def check_exits():
         
         entry_time = datetime.fromisoformat(pos['entry_time'])
         hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+        entry_price = pos['entry_price']
         
-        # Check exit conditions
-        pnl_pct = (current_price / pos['entry_price'] - 1) * 100
+        # Update peak price
+        peak_price = pos.get('peak_price', entry_price)
+        if current_price > peak_price:
+            peak_price = current_price
+            pos['peak_price'] = peak_price
         
-        if current_price >= pos['target_price']:
-            close_position(pos, current_price, 'TARGET_HIT', pnl_pct)
-        elif current_price <= pos['stop_loss']:
+        # Calculate P&L
+        pnl_pct = (current_price / entry_price - 1) * 100
+        
+        # TRAILING STOP LOGIC
+        # Once profitable, use trailing stop (30% below peak)
+        if current_price > entry_price:
+            trailing_stop = peak_price * 0.70  # 30% below peak
+            pos['trailing_stop'] = trailing_stop
+            
+            if current_price <= trailing_stop:
+                # Hit trailing stop - lock in profits
+                close_position(pos, current_price, 'TRAILING_STOP', pnl_pct)
+                continue
+        
+        # INITIAL STOP LOSS (before profitable)
+        # -30% hard stop on rugs
+        initial_stop = pos.get('initial_stop', entry_price * 0.70)
+        if current_price <= initial_stop:
             close_position(pos, current_price, 'STOP_LOSS', pnl_pct)
-        elif hours_held >= 2:  # 2 hours (was 6) - exit faster
+            continue
+        
+        # TIME LIMIT (safety exit after 4 hours)
+        if hours_held >= 4:
             close_position(pos, current_price, 'TIME_LIMIT', pnl_pct)
+            continue
+        
+        # Save updated position (peak price, trailing stop)
+        save_positions(positions)
 
 
 def close_position(pos: Dict, exit_price: float, reason: str, pnl_pct: float):
