@@ -26,10 +26,11 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
 
 # Channels to monitor
-# Tested Apr 4 2026 - Only 2 active channels found out of 40+ tested
+# Tested Apr 4 2026 - 3 active channels found out of 50+ tested
 CHANNELS = [
-    '@gmgnsignals',          # 100 contracts/day - GMGN Featured Signals
-    '@batman_gem',           # 25 contracts/day - Batman's Gems (high volume, hit-or-miss)
+    '@gmgnsignals',          # 100 contracts/day - GMGN Featured Signals (Solana)
+    '@XAceCalls',            # 84 contracts/day - XAce Calls Multichain (NEW!)
+    '@batman_gem',           # 25 contracts/day - Batman's Gems (high volume)
 ]
 
 # Hype keywords
