@@ -378,6 +378,11 @@ TEMPLATE = '''
         let balanceChart = null;
         
         function formatMoney(val) {
+            if (val === null || val === undefined) return '-';
+            // Handle tiny crypto prices (scientific notation)
+            if (val < 0.01) {
+                return '$' + val.toFixed(8);
+            }
             return '$' + val.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
         }
         
