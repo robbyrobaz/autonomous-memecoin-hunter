@@ -19,7 +19,7 @@ SIGNALS_LOG = BASE_DIR / 'logs' / 'signals.jsonl'
 TRADES_LOG = BASE_DIR / 'logs' / 'paper_trades.jsonl'
 REJECTIONS_LOG = BASE_DIR / 'logs' / 'rejections.jsonl'
 
-STARTING_BALANCE = 10000.0
+STARTING_BALANCE = 100.0
 
 def load_balance():
     """Get current balance"""
@@ -120,8 +120,10 @@ def api_data():
     for pos in closed_positions:
         pos['time_ago'] = time_ago(pos.get('exit_time', pos['entry_time']))
     
-    # Calculate metrics
-    total_pnl = balance - STARTING_BALANCE
+    # Calculate metrics INCLUDING open position current values
+    open_positions_value = sum(pos.get('size_usd', 0) + pos.get('current_pnl_usd', 0) for pos in open_positions)
+    total_portfolio_value = balance + open_positions_value
+    total_pnl = total_portfolio_value - STARTING_BALANCE
     total_pnl_pct = (total_pnl / STARTING_BALANCE) * 100
     
     winners = [p for p in closed_positions if p.get('pnl_usd', 0) > 0]
