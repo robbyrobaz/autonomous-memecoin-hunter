@@ -126,11 +126,26 @@ def api_data():
     total_pnl = total_portfolio_value - STARTING_BALANCE
     total_pnl_pct = (total_pnl / STARTING_BALANCE) * 100
     
+    # Trading metrics for trailing stop strategy
     winners = [p for p in closed_positions if p.get('pnl_usd', 0) > 0]
+    losers = [p for p in closed_positions if p.get('pnl_usd', 0) < 0]
+    
+    total_wins = sum(p.get('pnl_usd', 0) for p in winners)
+    total_losses = abs(sum(p.get('pnl_usd', 0) for p in losers))
+    
+    # Profit Factor: total wins / total losses (>1 = profitable)
+    profit_factor = (total_wins / total_losses) if total_losses > 0 else 0
+    
+    # Average win/loss
+    avg_win = (total_wins / len(winners)) if winners else 0
+    avg_loss = (total_losses / len(losers)) if losers else 0
+    
+    # Win rate (kept for reference but not primary metric)
     win_rate = (len(winners) / len(closed_positions) * 100) if closed_positions else 0
     
-    target_hits = [p for p in closed_positions if p.get('exit_reason') == 'TARGET_HIT']
-    target_hit_rate = (len(target_hits) / len(closed_positions) * 100) if closed_positions else 0
+    # Trailing stops hit
+    trailing_stops = [p for p in closed_positions if p.get('exit_reason') == 'TRAILING_STOP']
+    trailing_stop_rate = (len(trailing_stops) / len(closed_positions) * 100) if closed_positions else 0
     
     # Best/worst trades
     best_trade = max(closed_positions, key=lambda p: p.get('pnl_usd', 0)) if closed_positions else None
@@ -155,7 +170,6 @@ def api_data():
             'channel': channel,
             'trades': stats['trades'],
             'win_pct': round(win_pct, 1),
-            'target_pct': round(target_pct, 1),
             'pnl': round(stats['pnl'], 2)
         })
     
@@ -171,19 +185,24 @@ def api_data():
             })
     
     return jsonify({
-        'balance': round(balance, 2),
-        'starting_balance': STARTING_BALANCE,
-        'total_pnl': round(total_pnl, 2),
-        'total_pnl_pct': round(total_pnl_pct, 2),
+        'balance': balance,
         'open_positions': open_positions,
-        'closed_positions': sorted(closed_positions, key=lambda p: p.get('exit_time', ''), reverse=True)[:20],
+        'closed_positions': closed_positions,
+        'starting_balance': STARTING_BALANCE,
+        'total_pnl': total_pnl,
+        'total_pnl_pct': total_pnl_pct,
         'total_signals': len(signals),
         'total_rejections': len(rejections),
         'total_trades': len(positions),
         'open_count': len(open_positions),
         'closed_count': len(closed_positions),
         'win_rate': round(win_rate, 1),
-        'target_hit_rate': round(target_hit_rate, 1),
+        'profit_factor': round(profit_factor, 2),
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'total_wins': total_wins,
+        'total_losses': total_losses,
+        'trailing_stop_rate': round(trailing_stop_rate, 1),
         'best_trade': best_trade,
         'worst_trade': worst_trade,
         'channels': channels_list,
@@ -413,22 +432,30 @@ TEMPLATE = '''
                 </div>
                 
                 <div class="metric">
-                    <div class="metric-label">Win Rate</div>
-                    <div class="metric-value ${data.win_rate >= 55 ? 'positive' : data.win_rate < 45 ? 'negative' : 'neutral'}">
-                        ${data.win_rate.toFixed(1)}%
+                    <div class="metric-label">Profit Factor</div>
+                    <div class="metric-value ${data.profit_factor >= 1 ? 'positive' : 'negative'}">
+                        ${data.profit_factor.toFixed(2)}x
                     </div>
                     <div class="metric-change neutral">
-                        Target: ≥55%
+                        ${data.profit_factor >= 1 ? '✓ Profitable' : 'Target: ≥1.0x'}
                     </div>
                 </div>
                 
                 <div class="metric">
-                    <div class="metric-label">2x Hit Rate</div>
-                    <div class="metric-value ${data.target_hit_rate >= 30 ? 'positive' : 'neutral'}">
-                        ${data.target_hit_rate.toFixed(1)}%
+                    <div class="metric-label">Avg Win / Loss</div>
+                    <div class="metric-value">${formatMoney(data.avg_win)} / ${formatMoney(data.avg_loss)}</div>
+                    <div class="metric-change neutral">
+                        Ratio: ${data.avg_loss > 0 ? (data.avg_win / data.avg_loss).toFixed(2) + 'x' : '-'}
+                    </div>
+                </div>
+                
+                <div class="metric">
+                    <div class="metric-label">Total Wins / Losses</div>
+                    <div class="metric-value">
+                        <span class="positive">${formatMoney(data.total_wins)}</span> / <span class="negative">${formatMoney(data.total_losses)}</span>
                     </div>
                     <div class="metric-change neutral">
-                        Target: ≥30%
+                        Trailing stops: ${data.trailing_stop_rate.toFixed(0)}%
                     </div>
                 </div>
                 
@@ -437,16 +464,6 @@ TEMPLATE = '''
                     <div class="metric-value">${data.total_signals}</div>
                     <div class="metric-change neutral">
                         ${data.total_rejections} rejected
-                    </div>
-                </div>
-                
-                <div class="metric">
-                    <div class="metric-label">Best Trade</div>
-                    <div class="metric-value positive">
-                        ${data.best_trade ? formatMoney(data.best_trade.pnl_usd) : '-'}
-                    </div>
-                    <div class="metric-change neutral">
-                        ${data.best_trade ? formatPct(data.best_trade.pnl_pct) : 'No trades yet'}
                     </div>
                 </div>
             `;
