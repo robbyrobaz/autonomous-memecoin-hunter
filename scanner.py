@@ -26,10 +26,10 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
 
 # Channels to monitor
-# Note: Most Telegram channels are dead. @gmgnsignals posts 100 contracts/day (tested Apr 4 2026)
+# Tested Apr 4 2026 - Only 2 active channels found out of 40+ tested
 CHANNELS = [
-    '@gmgnsignals',          # 100 contracts/day (only active channel found)
-    '@soltrending',          # Backup (low activity but exists)
+    '@gmgnsignals',          # 100 contracts/day - GMGN Featured Signals
+    '@batman_gem',           # 25 contracts/day - Batman's Gems (high volume, hit-or-miss)
 ]
 
 # Hype keywords
@@ -44,8 +44,8 @@ POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 
 # Paper trading state
 PAPER_BALANCE = 10000.0
-POSITION_SIZE_PCT = 0.05  # 5% per trade
-MAX_POSITIONS = 3
+POSITION_SIZE_PCT = 0.10  # 10% per trade (was 5%) - more aggressive
+MAX_POSITIONS = 5  # 5 concurrent (was 3)
 
 
 def extract_contract_address(text: str) -> Optional[str]:
@@ -91,10 +91,11 @@ def check_rugcheck(contract: str) -> tuple[bool, str, Dict]:
         score = data.get('score', 0)
         risks = data.get('risks', [])
         
-        if score < 60:
+        # AGGRESSIVE: Accept score >= 20 (was 60) - we want risky early plays
+        if score < 20:
             return False, f"Rug score too low: {score}", data
         
-        return True, "PASS", data
+        return True, f"PASS (score: {score})", data
     except Exception as e:
         return False, f"Rugcheck error: {e}", {}
 
@@ -129,7 +130,7 @@ def check_birdeye(contract: str) -> tuple[bool, str, Dict]:
 
 
 def check_dexscreener(contract: str) -> tuple[bool, str, Dict]:
-    """Check price, volume, age via Dexscreener"""
+    """Check price, volume, age via Dexscreener - MINIMAL filters for early entry"""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
         resp = requests.get(url, timeout=10)
@@ -150,20 +151,15 @@ def check_dexscreener(contract: str) -> tuple[bool, str, Dict]:
         volume_24h = float(pair.get('volume', {}).get('h24', 0) or 0)
         created_at = pair.get('pairCreatedAt')
         
-        if liquidity < 5000:  # Lowered from 10k to catch more early coins
-            return False, f"Low DEX liquidity: ${liquidity:,.0f}", pair
+        # SUPER RELAXED: Just need ANY liquidity (was $5k)
+        if liquidity < 500:
+            return False, f"No liquidity: ${liquidity:,.0f}", pair
         
-        if volume_24h < 2000:  # Lowered from 5k
-            return False, f"Low 24h volume: ${volume_24h:,.0f}", pair
+        # REMOVED volume check - early coins have low volume
         
-        # Check age (lowered from 0.5h to 0.2h to catch earlier pumps)
-        if created_at:
-            created = datetime.fromtimestamp(created_at / 1000)
-            age_hours = (datetime.now() - created).total_seconds() / 3600
-            if age_hours < 0.2:
-                return False, f"Too new: {age_hours:.1f}h old", pair
+        # REMOVED age check - we WANT brand new coins
         
-        return True, "PASS", pair
+        return True, f"PASS (liq: ${liquidity:,.0f})", pair
     except Exception as e:
         return False, f"Dexscreener error: {e}", {}
 
@@ -219,8 +215,8 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
         'entry_price': entry_price,
         'entry_time': datetime.now().isoformat(),
         'size_usd': size,
-        'target_price': entry_price * 2.0,  # 100% profit
-        'stop_loss': entry_price * 0.7,  # -30% stop
+        'target_price': entry_price * 1.5,  # 50% profit (was 100%) - quicker exits
+        'stop_loss': entry_price * 0.5,  # -50% stop (was -30%) - riskier
         'status': 'OPEN',
         'signal_data': signal_data
     }
@@ -259,7 +255,7 @@ def check_exits():
             close_position(pos, current_price, 'TARGET_HIT', pnl_pct)
         elif current_price <= pos['stop_loss']:
             close_position(pos, current_price, 'STOP_LOSS', pnl_pct)
-        elif hours_held >= 6:
+        elif hours_held >= 2:  # 2 hours (was 6) - exit faster
             close_position(pos, current_price, 'TIME_LIMIT', pnl_pct)
 
 
