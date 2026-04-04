@@ -535,7 +535,7 @@ TEMPLATE = '''
             }
             
             let html = '<table><thead><tr>';
-            html += '<th>Channel</th><th>Trades</th><th>Win %</th><th>2x %</th><th>P&L</th></tr></thead><tbody>';
+            html += '<th>Channel</th><th>Trades</th><th>Win %</th><th>P&L</th></tr></thead><tbody>';
             
             channels.forEach(ch => {
                 const pnlClass = ch.pnl >= 0 ? 'positive' : 'negative';
@@ -543,7 +543,6 @@ TEMPLATE = '''
                 html += `<td>${ch.channel}</td>`;
                 html += `<td>${ch.trades}</td>`;
                 html += `<td>${ch.win_pct}%</td>`;
-                html += `<td>${ch.target_pct}%</td>`;
                 html += `<td class="${pnlClass}">${formatMoney(ch.pnl)}</td>`;
                 html += '</tr>';
             });
