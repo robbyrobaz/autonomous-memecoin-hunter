@@ -45,8 +45,8 @@ POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 
 # Paper trading state
 PAPER_BALANCE = 100.0  # $100 total (realistic small account)
-POSITION_SIZE = 10.0  # $10 per trade (fixed size)
-MAX_POSITIONS = 5  # 5 concurrent
+POSITION_SIZE = 1.0  # $1 per trade (MORE TRADES, more data!)
+MAX_POSITIONS = 20  # 20 concurrent (collect more data)
 
 
 def extract_contract_address(text: str) -> Optional[str]:
@@ -92,8 +92,8 @@ def check_rugcheck(contract: str) -> tuple[bool, str, Dict]:
         score = data.get('score', 0)
         risks = data.get('risks', [])
         
-        # AGGRESSIVE: Accept score >= 20 (was 60) - we want risky early plays
-        if score < 20:
+        # SUPER AGGRESSIVE: Accept score >= 10 (was 20) - MORE DATA!
+        if score < 10:
             return False, f"Rug score too low: {score}", data
         
         return True, f"PASS (score: {score})", data
@@ -152,8 +152,8 @@ def check_dexscreener(contract: str) -> tuple[bool, str, Dict]:
         volume_24h = float(pair.get('volume', {}).get('h24', 0) or 0)
         created_at = pair.get('pairCreatedAt')
         
-        # SUPER RELAXED: Just need ANY liquidity (was $5k)
-        if liquidity < 500:
+        # ULTRA AGGRESSIVE: Accept $100+ liquidity (was $500)
+        if liquidity < 100:
             return False, f"No liquidity: ${liquidity:,.0f}", pair
         
         # REMOVED volume check - early coins have low volume
@@ -195,8 +195,8 @@ def save_positions(positions: List[Dict]):
         json.dump(positions, f, indent=2)
 
 
-def open_position(contract: str, entry_price: float, signal_data: Dict):
-    """Open a paper trading position"""
+def open_position(contract: str, entry_price: float, signal_data: Dict, market_data: Dict = None):
+    """Open a paper trading position with FULL DATA COLLECTION"""
     positions = load_positions()
     
     # Check position limits
@@ -210,7 +210,7 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
         balance = float(f.read().strip())
     
     # Fixed position size
-    size = POSITION_SIZE  # $10 fixed
+    size = POSITION_SIZE  # $1 fixed
     
     position = {
         'contract': contract,
@@ -220,8 +220,18 @@ def open_position(contract: str, entry_price: float, signal_data: Dict):
         'initial_stop': entry_price * 0.70,  # -30% initial stop (tight on rugs)
         'trailing_stop': None,  # Activated once profitable
         'peak_price': entry_price,  # Track highest price for trailing
+        'peak_time': None,  # When did we hit peak?
         'status': 'OPEN',
-        'signal_data': signal_data
+        'signal_data': signal_data,
+        # ENHANCED DATA COLLECTION FOR ANALYSIS
+        'market_data': market_data or {},  # Store liquidity, volume, rugcheck score
+        'entry_metrics': {
+            'liquidity': market_data.get('liquidity', 0) if market_data else 0,
+            'volume_24h': market_data.get('volume_24h', 0) if market_data else 0,
+            'rugcheck_score': signal_data.get('rugcheck_score', 0),
+            'holder_count': market_data.get('holders', 0) if market_data else 0,
+            'age_hours': market_data.get('age_hours', 0) if market_data else 0,
+        }
     }
     
     positions.append(position)
@@ -252,11 +262,12 @@ def check_exits():
         hours_held = (datetime.now() - entry_time).total_seconds() / 3600
         entry_price = pos['entry_price']
         
-        # Update peak price
+        # Update peak price and track WHEN we hit peak
         peak_price = pos.get('peak_price', entry_price)
         if current_price > peak_price:
             peak_price = current_price
             pos['peak_price'] = peak_price
+            pos['peak_time'] = datetime.now().isoformat()  # Track when we peaked
         
         # Calculate P&L
         pnl_pct = (current_price / entry_price - 1) * 100
@@ -287,14 +298,33 @@ def check_exits():
         # Save updated position (peak price, trailing stop)
         save_positions(positions)
 
-
 def close_position(pos: Dict, exit_price: float, reason: str, pnl_pct: float):
-    """Close a position"""
+    """Close position and calculate P&L with ANALYTICS DATA"""
+    pos['status'] = 'CLOSED'
     pos['exit_price'] = exit_price
     pos['exit_time'] = datetime.now().isoformat()
     pos['exit_reason'] = reason
     pos['pnl_pct'] = pnl_pct
     pos['pnl_usd'] = pos['size_usd'] * (pnl_pct / 100)
+    
+    # ANALYTICS: How good was this trade?
+    entry_time = datetime.fromisoformat(pos['entry_time'])
+    exit_time = datetime.fromisoformat(pos['exit_time'])
+    peak_price = pos.get('peak_price', pos['entry_price'])
+    
+    pos['analytics'] = {
+        'time_in_position_minutes': (exit_time - entry_time).total_seconds() / 60,
+        'peak_gain_pct': ((peak_price / pos['entry_price']) - 1) * 100,
+        'exit_from_peak_pct': ((exit_price / peak_price) - 1) * 100,  # How much we gave back
+        'trailing_stop_worked': reason == 'TRAILING_STOP',
+        'hit_stop_loss': reason == 'STOP_LOSS',
+        'time_to_peak_minutes': None,  # Calculate if we have peak_time
+    }
+    
+    # Calculate time to peak if we tracked it
+    if pos.get('peak_time'):
+        peak_time = datetime.fromisoformat(pos['peak_time'])
+        pos['analytics']['time_to_peak_minutes'] = (peak_time - entry_time).total_seconds() / 60
     pos['status'] = 'CLOSED'
     
     # Update balance
@@ -465,20 +495,29 @@ async def main():
         
         dex_pass, dex_msg, dex_data = check_dexscreener(contract)
         if not dex_pass:
-            print(f"  ❌ Dexscreener: {dex_msg}")
-            log_rejection(contract, f"Dexscreener: {dex_msg}", signal)
+            print(f\"  ❌ Dexscreener: {dex_msg}\")
+            log_rejection(contract, f\"Dexscreener: {dex_msg}\", signal)
             continue
-        print(f"  ✅ Dexscreener: {dex_msg}")
+        print(f\"  ✅ Dexscreener: {dex_msg}\")
         
         # Get entry price
         price = get_current_price(contract)
         if not price:
-            print(f"  ❌ Could not fetch price")
-            log_rejection(contract, "Price unavailable", signal)
+            print(f\"  ❌ Could not fetch price\")
+            log_rejection(contract, \"Price unavailable\", signal)
             continue
         
+        # Collect market data for ANALYSIS
+        market_data = {
+            'liquidity': float(dex_data.get('liquidity', {}).get('usd', 0) or 0),
+            'volume_24h': float(dex_data.get('volume', {}).get('h24', 0) or 0),
+            'holders': rug_data.get('topHolders', {}).get('count', 0) if rug_pass else 0,
+            'age_hours': (datetime.now() - datetime.fromtimestamp(dex_data.get('pairCreatedAt', 0) / 1000)).total_seconds() / 3600 if dex_data.get('pairCreatedAt') else 0,
+        }
+        signal['rugcheck_score'] = rug_data.get('score', 0) if rug_pass else 0
+        
         # Open position
-        open_position(contract, price, signal)
+        open_position(contract, price, signal, market_data)
     
     # Summary
     with open(balance_file) as f:
