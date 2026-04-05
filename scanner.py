@@ -46,7 +46,7 @@ POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 # Paper trading state
 PAPER_BALANCE = 100.0  # $100 total (realistic small account)
 POSITION_SIZE = 1.0  # $1 per trade (MORE TRADES, more data!)
-MAX_POSITIONS = 50  # 50 concurrent (YOLO MODE - catch everything!)
+MAX_POSITIONS = 100  # 100 concurrent = full capital deployed (YOLO MODE!)
 
 
 def extract_contract_address(text: str) -> Optional[str]:
