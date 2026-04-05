@@ -46,7 +46,7 @@ POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 # Paper trading state
 PAPER_BALANCE = 100.0  # $100 total (realistic small account)
 POSITION_SIZE = 1.0  # $1 per trade (MORE TRADES, more data!)
-MAX_POSITIONS = 20  # 20 concurrent (collect more data)
+MAX_POSITIONS = 50  # 50 concurrent (YOLO MODE - catch everything!)
 
 
 def extract_contract_address(text: str) -> Optional[str]:
@@ -511,10 +511,10 @@ async def main():
         market_data = {
             'liquidity': float(dex_data.get('liquidity', {}).get('usd', 0) or 0),
             'volume_24h': float(dex_data.get('volume', {}).get('h24', 0) or 0),
-            'holders': rug_data.get('topHolders', {}).get('count', 0) if rug_pass else 0,
+            'holders': rug_data.get('topHolders', {}).get('count', 0) if (rug_pass and isinstance(rug_data.get('topHolders'), dict)) else 0,
             'age_hours': (datetime.now() - datetime.fromtimestamp(dex_data.get('pairCreatedAt', 0) / 1000)).total_seconds() / 3600 if dex_data.get('pairCreatedAt') else 0,
         }
-        signal['rugcheck_score'] = rug_data.get('score', 0) if rug_pass else 0
+        signal['rugcheck_score'] = rug_data.get('score', 0) if (rug_pass and isinstance(rug_data, dict)) else 0
         
         # Open position
         open_position(contract, price, signal, market_data)
