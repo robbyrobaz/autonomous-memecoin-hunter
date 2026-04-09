@@ -25,7 +25,12 @@ KEYPAIR_FILE = BASE_DIR / 'data' / 'hot_wallet.json'
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-RPC_URL = "https://api.mainnet-beta.solana.com"
+# Use Helius RPC if available (much higher rate limits than public RPC)
+_helius_key = os.environ.get("HELIUS_API_KEY", "")
+if _helius_key:
+    RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={_helius_key}"
+else:
+    RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Priority fee for faster inclusion (in lamports)
 PRIORITY_FEE_LAMPORTS = 1_000_000  # 0.001 SOL
@@ -169,32 +174,36 @@ def execute_swap(input_mint: str, output_mint: str, amount_lamports: int,
 
 
 def buy_token(token_mint: str, sol_amount: float) -> Tuple[bool, str, dict]:
-    """Buy a token with SOL."""
-    # Route pumpfun tokens through PumpPortal
-    if token_mint.endswith("pump"):
-        print(f"🐸 Routing to PumpPortal (pumpfun token): {token_mint[:16]}...")
+    """Buy a token with SOL. Try PumpPortal first (faster, no rate limits), Jupiter fallback."""
+    # PumpPortal first for ALL tokens (per reef API_BATCHING.md strategy)
+    # If it 400s (graduated token), fall back to Jupiter
+    print(f"🐸 Trying PumpPortal first: {token_mint[:16]}...")
+    try:
         result = buy_pumpfun(token_mint, sol_amount)
         if result and result.get("tx_hash"):
             return True, result["tx_hash"], result
-        return False, "PumpPortal buy failed", {}
+        print(f"  PumpPortal failed, falling back to Jupiter")
+    except Exception as e:
+        print(f"  PumpPortal error: {e}, falling back to Jupiter")
 
     lamports = int(sol_amount * 1_000_000_000)
-    print(f"🛒 Buying {token_mint[:8]}... with {sol_amount} SOL ({lamports} lamports)")
+    print(f"🛒 Jupiter fallback: Buying {token_mint[:8]}... with {sol_amount} SOL ({lamports} lamports)")
     time.sleep(1)  # Rate limit protection for Jupiter
     return execute_swap(SOL_MINT, token_mint, lamports)
 
 
 def sell_token(token_mint: str, token_amount_raw: int) -> Tuple[bool, str, dict]:
-    """Sell a token back to SOL."""
-    # Route pumpfun tokens through PumpPortal
-    if token_mint.endswith("pump"):
-        print(f"🐸 Routing to PumpPortal (pumpfun token): {token_mint[:16]}...")
+    """Sell a token back to SOL. Try PumpPortal first, Jupiter fallback."""
+    print(f"🐸 Trying PumpPortal sell first: {token_mint[:16]}...")
+    try:
         result = sell_pumpfun(token_mint, token_amount_raw)
         if result and result.get("tx_hash"):
             return True, result["tx_hash"], result
-        return False, "PumpPortal sell failed", {}
+        print(f"  PumpPortal sell failed, falling back to Jupiter")
+    except Exception as e:
+        print(f"  PumpPortal sell error: {e}, falling back to Jupiter")
 
-    print(f"💰 Selling {token_mint[:8]}... ({token_amount_raw} raw tokens)")
+    print(f"💰 Jupiter fallback: Selling {token_mint[:8]}... ({token_amount_raw} raw tokens)")
     time.sleep(1)  # Rate limit protection for Jupiter
     return execute_swap(token_mint, SOL_MINT, token_amount_raw)
 
