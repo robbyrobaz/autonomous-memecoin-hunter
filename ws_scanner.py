@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""
+Real-Time WebSocket Memecoin Scanner — PumpPortal New Token Stream
+
+Connects to wss://pumpportal.fun/api/data and instantly buys every new token
+created on PumpFun. YOLO mode — trailing stop is the only risk management.
+
+Replaces the 5-minute cron polling with instant real-time buying.
+"""
+
+import asyncio
+import json
+import os
+import sys
+import time
+import traceback
+import requests
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import websockets
+
+# === CONFIG ===
+LIVE_SOL_AMOUNT = 0.005        # ~$0.65 per trade
+SOL_PRICE_USD = 130.0          # Approximate, for display
+TRAILING_STOP_PCT = 0.12       # 12% below peak
+HARD_STOP_PCT = 0.30           # entry_price * 0.30 = -70% hard stop
+TIME_LIMIT_HOURS = 6           # Max hold time
+MAX_POSITIONS = 100            # Max concurrent positions
+POSITION_SIZE = 1.0            # $1 paper position
+PAPER_BALANCE_DEFAULT = 100.0
+
+EXIT_CHECK_INTERVAL = 30       # Seconds between exit checks
+STATUS_INTERVAL = 60           # Seconds between status prints
+WS_URL = "wss://pumpportal.fun/api/data"
+RECONNECT_BASE_DELAY = 2       # Starting reconnect delay (seconds)
+RECONNECT_MAX_DELAY = 120      # Max reconnect delay
+
+# === PATHS ===
+BASE_DIR = Path(__file__).parent
+SIGNALS_LOG = BASE_DIR / 'logs' / 'signals.jsonl'
+TRADES_LOG = BASE_DIR / 'logs' / 'paper_trades.jsonl'
+LIVE_TRADES_LOG = BASE_DIR / 'logs' / 'live_trades.jsonl'
+POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
+LIVE_POSITIONS_FILE = BASE_DIR / 'data' / 'live_positions.json'
+LIVE_BALANCE_FILE = BASE_DIR / 'data' / 'live_balance.txt'
+BALANCE_FILE = BASE_DIR / 'data' / 'balance.txt'
+
+# === LOAD ENV ===
+from dotenv import load_dotenv
+load_dotenv(BASE_DIR / '.env')
+
+# === IMPORT EXECUTORS ===
+sys.path.insert(0, str(BASE_DIR))
+
+try:
+    import pumpfun_executor
+    print("✅ pumpfun_executor loaded")
+except ImportError as e:
+    print(f"❌ pumpfun_executor import failed: {e}")
+    pumpfun_executor = None
+
+try:
+    import swap_executor
+    print("✅ swap_executor loaded")
+except ImportError as e:
+    print(f"❌ swap_executor import failed: {e}")
+    swap_executor = None
+
+# === STATS ===
+stats = {
+    'tokens_seen': 0,
+    'buys_executed': 0,
+    'buys_failed': 0,
+    'ws_reconnects': 0,
+    'start_time': datetime.now().isoformat(),
+}
+
+
+# ─── Position Management (mirrors scanner.py) ──────────────────────────
+
+def load_positions() -> List[Dict]:
+    """Load paper positions"""
+    if POSITIONS_FILE.exists():
+        try:
+            with open(POSITIONS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def save_positions(positions: List[Dict]):
+    """Save paper positions (atomic write)"""
+    tmp = POSITIONS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(positions, f, indent=2)
+    tmp.rename(POSITIONS_FILE)
+
+
+def load_live_positions() -> List[Dict]:
+    """Load live positions"""
+    if LIVE_POSITIONS_FILE.exists():
+        try:
+            with open(LIVE_POSITIONS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def save_live_positions(positions: List[Dict]):
+    """Save live positions (atomic write)"""
+    tmp = LIVE_POSITIONS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(positions, f, indent=2)
+    tmp.rename(LIVE_POSITIONS_FILE)
+
+
+def get_live_balance() -> float:
+    if LIVE_BALANCE_FILE.exists():
+        try:
+            return float(LIVE_BALANCE_FILE.read_text().strip())
+        except (ValueError, IOError):
+            return 0.0
+    return 0.0
+
+
+def save_live_balance(balance: float):
+    LIVE_BALANCE_FILE.write_text(str(round(balance, 8)))
+
+
+def get_paper_balance() -> float:
+    if BALANCE_FILE.exists():
+        try:
+            return float(BALANCE_FILE.read_text().strip())
+        except (ValueError, IOError):
+            return PAPER_BALANCE_DEFAULT
+    return PAPER_BALANCE_DEFAULT
+
+
+def save_paper_balance(balance: float):
+    BALANCE_FILE.write_text(str(round(balance, 4)))
+
+
+# ─── Logging (mirrors scanner.py) ──────────────────────────────────────
+
+def log_signal(contract: str, name: str, symbol: str):
+    """Log detected signal"""
+    data = {
+        'timestamp': datetime.now().isoformat(),
+        'contract': contract,
+        'score': 0,
+        'channel': 'pumpportal_ws',
+        'message_snippet': f"New token: {name} ({symbol}) — {contract[:16]}..."
+    }
+    with open(SIGNALS_LOG, 'a') as f:
+        f.write(json.dumps(data) + '\n')
+
+
+def log_trade(position: Dict, action: str, log_file: Path):
+    """Log trade action"""
+    data = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        **position
+    }
+    with open(log_file, 'a') as f:
+        f.write(json.dumps(data) + '\n')
+
+
+# ─── Dexscreener Batch Price Fetch (mirrors scanner.py) ────────────────
+
+def batch_fetch_dexscreener(contracts: List[str]) -> Dict[str, Dict]:
+    """Batch fetch Dexscreener data for up to 30 tokens in ONE call."""
+    result = {}
+    if not contracts:
+        return result
+
+    unique_contracts = list(set(contracts))
+
+    for i in range(0, len(unique_contracts), 30):
+        chunk = unique_contracts[i:i + 30]
+        try:
+            joined = ','.join(chunk)
+            url = f"https://api.dexscreener.com/tokens/v1/solana/{joined}"
+            resp = requests.get(url, timeout=15)
+
+            if resp.status_code != 200:
+                print(f"⚠️ Dexscreener batch error: {resp.status_code}")
+                continue
+
+            pairs = resp.json()
+            if not isinstance(pairs, list):
+                continue
+
+            for pair in pairs:
+                addr = pair.get('baseToken', {}).get('address', '')
+                if not addr:
+                    continue
+                liq = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+                existing = result.get(addr)
+                if not existing or liq > float(existing.get('liquidity', {}).get('usd', 0) or 0):
+                    result[addr] = pair
+
+            if i + 30 < len(unique_contracts):
+                time.sleep(0.25)
+
+        except Exception as e:
+            print(f"❌ Dexscreener batch error: {e}")
+
+    return result
+
+
+def batch_get_current_prices(contracts: List[str]) -> Dict[str, float]:
+    """Get current prices for multiple tokens in batch."""
+    cache = batch_fetch_dexscreener(contracts)
+    prices = {}
+    for contract, pair in cache.items():
+        try:
+            price = float(pair.get('priceUsd', 0) or 0)
+            if price > 0:
+                prices[contract] = price
+        except (ValueError, TypeError):
+            pass
+    return prices
+
+
+def get_token_balance(contract: str) -> int:
+    """Check if we actually hold tokens of a given mint."""
+    try:
+        from solders.pubkey import Pubkey
+        from solana.rpc.api import Client
+        from solana.rpc.types import TokenAccountOpts
+
+        kp = swap_executor.load_keypair()
+        client = Client(swap_executor.RPC_URL)
+        resp = client.get_token_accounts_by_owner_json_parsed(
+            kp.pubkey(),
+            TokenAccountOpts(mint=Pubkey.from_string(contract)),
+        )
+        if not resp.value:
+            return 0
+        account_data = resp.value[0].account.data
+        parsed = json.loads(account_data.to_json())
+        return int(parsed["parsed"]["info"]["tokenAmount"]["amount"])
+    except Exception as e:
+        print(f"⚠️ get_token_balance error: {e}")
+        return 0
+
+
+# ─── Buy Logic ──────────────────────────────────────────────────────────
+
+def execute_buy(mint: str, name: str, symbol: str):
+    """
+    Buy a new token: live buy via PumpPortal, open paper + live positions.
+    Runs synchronously (called from async via run_in_executor).
+    """
+    now = datetime.now()
+
+    # Check position limits
+    positions = load_positions()
+    open_paper = len([p for p in positions if p['status'] == 'OPEN'])
+    live_positions = load_live_positions()
+    open_live = len([p for p in live_positions if p['status'] == 'OPEN'])
+
+    if open_paper >= MAX_POSITIONS:
+        print(f"⚠️ Max paper positions ({MAX_POSITIONS}) reached, skip {mint[:12]}...")
+        return False
+
+    # Check if already in this token (paper)
+    for p in positions:
+        if p['contract'] == mint and p['status'] == 'OPEN':
+            print(f"⚠️ Already have paper position in {mint[:12]}...")
+            return False
+
+    # --- LIVE BUY via PumpPortal ---
+    live_buy_result = None
+    if pumpfun_executor:
+        try:
+            sol_balance = swap_executor.get_sol_balance() if swap_executor else 999
+            if sol_balance < LIVE_SOL_AMOUNT + 0.002:
+                print(f"⚠️ LIVE: Insufficient SOL: {sol_balance:.4f}")
+            else:
+                live_buy_result = pumpfun_executor.buy_pumpfun(mint, LIVE_SOL_AMOUNT)
+        except Exception as e:
+            print(f"❌ LIVE BUY exception: {e}")
+
+    # We may not get a price from Dexscreener immediately for brand new tokens.
+    # Use a placeholder entry price; exit logic will fetch real prices later.
+    entry_price = 0.0000001  # Placeholder — will be updated on first exit check
+
+    signal_data = {
+        'channel': 'pumpportal_ws',
+        'name': name,
+        'symbol': symbol,
+        'score': 0,
+        'message_snippet': f"New PumpFun token: {name} ({symbol})",
+    }
+
+    # --- PAPER POSITION ---
+    paper_pos = {
+        'contract': mint,
+        'entry_price': entry_price,
+        'entry_time': now.isoformat(),
+        'size_usd': POSITION_SIZE,
+        'initial_stop': entry_price * HARD_STOP_PCT,
+        'trailing_stop': None,
+        'peak_price': entry_price,
+        'peak_time': None,
+        'status': 'OPEN',
+        'signal_data': signal_data,
+        'market_data': {'token_name': name, 'token_symbol': symbol},
+        'entry_metrics': {
+            'liquidity': 0,
+            'volume_24h': 0,
+            'rugcheck_score': 0,
+            'holder_count': 0,
+            'age_hours': 0,
+        },
+        'source': 'ws_scanner',
+    }
+    positions.append(paper_pos)
+    save_positions(positions)
+
+    balance = get_paper_balance()
+    save_paper_balance(balance - POSITION_SIZE)
+
+    log_trade(paper_pos, 'OPEN', TRADES_LOG)
+    print(f"📝 Paper OPENED: {name} ({symbol}) {mint[:12]}...")
+
+    # --- LIVE POSITION ---
+    if live_buy_result and live_buy_result.get('tx_hash'):
+        live_pos = {
+            'contract': mint,
+            'entry_price': entry_price,
+            'entry_time': now.isoformat(),
+            'sol_spent': LIVE_SOL_AMOUNT,
+            'size_usd': LIVE_SOL_AMOUNT * SOL_PRICE_USD,
+            'tx_buy_sig': live_buy_result['tx_hash'],
+            'buy_details': {
+                'in_amount': live_buy_result.get('amount', 0),
+                'out_amount': 0,
+                'price_impact_pct': '0',
+                'confirmed': True,
+            },
+            'tokens_received': 0,
+            'initial_stop': entry_price * HARD_STOP_PCT,
+            'trailing_stop': None,
+            'peak_price': entry_price,
+            'peak_time': None,
+            'status': 'OPEN',
+            'signal_data': signal_data,
+            'market_data': {'token_name': name, 'token_symbol': symbol},
+            'sol_received': None,
+            'tx_sell_sig': None,
+            'source': 'ws_scanner',
+        }
+        live_positions.append(live_pos)
+        save_live_positions(live_positions)
+
+        live_bal = get_live_balance()
+        save_live_balance(live_bal - LIVE_SOL_AMOUNT)
+
+        log_trade(live_pos, 'OPEN', LIVE_TRADES_LOG)
+        print(f"🔴 LIVE OPENED: {name} ({symbol}) {mint[:12]}... tx: {live_buy_result['tx_hash'][:20]}...")
+        stats['buys_executed'] += 1
+    else:
+        stats['buys_failed'] += 1
+        if pumpfun_executor:
+            print(f"❌ LIVE BUY failed for {mint[:12]}...")
+
+    return True
+
+
+# ─── Exit Logic (mirrors scanner.py) ───────────────────────────────────
+
+def check_paper_exits():
+    """Check all open paper positions for exit conditions."""
+    positions = load_positions()
+    open_contracts = [p['contract'] for p in positions if p['status'] == 'OPEN']
+    if not open_contracts:
+        return
+
+    prices = batch_get_current_prices(open_contracts)
+    changed = False
+
+    for pos in positions:
+        if pos['status'] != 'OPEN':
+            continue
+
+        current_price = prices.get(pos['contract'])
+        if not current_price:
+            continue
+
+        entry_price = pos['entry_price']
+        entry_time = datetime.fromisoformat(pos['entry_time'])
+        hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+
+        # Update entry price if it was a placeholder
+        if entry_price < 0.000001 and current_price > 0:
+            pos['entry_price'] = current_price
+            pos['initial_stop'] = current_price * HARD_STOP_PCT
+            pos['peak_price'] = current_price
+            entry_price = current_price
+            changed = True
+
+        # Update peak
+        peak_price = pos.get('peak_price', entry_price)
+        if current_price > peak_price:
+            peak_price = current_price
+            pos['peak_price'] = peak_price
+            pos['peak_time'] = datetime.now().isoformat()
+            changed = True
+
+        pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
+        exit_reason = None
+
+        # Trailing stop
+        if current_price > entry_price:
+            trailing_stop = peak_price * (1 - TRAILING_STOP_PCT)
+            pos['trailing_stop'] = trailing_stop
+            if current_price <= trailing_stop:
+                exit_reason = 'TRAILING_STOP'
+
+        # Hard stop
+        if not exit_reason:
+            initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
+            if current_price <= initial_stop:
+                exit_reason = 'STOP_LOSS'
+
+        # Time limit
+        if not exit_reason and hours_held >= TIME_LIMIT_HOURS:
+            exit_reason = 'TIME_LIMIT'
+
+        if exit_reason:
+            close_paper_position(pos, current_price, exit_reason, pnl_pct)
+            changed = True
+
+    if changed:
+        # Re-save all positions with updates
+        save_positions(positions)
+
+
+def close_paper_position(pos: Dict, exit_price: float, reason: str, pnl_pct: float):
+    """Close a paper position."""
+    pos['status'] = 'CLOSED'
+    pos['exit_price'] = exit_price
+    pos['exit_time'] = datetime.now().isoformat()
+    pos['exit_reason'] = reason
+    pos['pnl_pct'] = pnl_pct
+    pos['pnl_usd'] = pos['size_usd'] * (pnl_pct / 100)
+
+    entry_time = datetime.fromisoformat(pos['entry_time'])
+    exit_time = datetime.fromisoformat(pos['exit_time'])
+    peak_price = pos.get('peak_price', pos['entry_price'])
+
+    pos['analytics'] = {
+        'time_in_position_minutes': (exit_time - entry_time).total_seconds() / 60,
+        'peak_gain_pct': ((peak_price / pos['entry_price']) - 1) * 100 if pos['entry_price'] > 0 else 0,
+        'exit_from_peak_pct': ((exit_price / peak_price) - 1) * 100 if peak_price > 0 else 0,
+        'trailing_stop_worked': reason == 'TRAILING_STOP',
+    }
+
+    # Update balance
+    balance = get_paper_balance()
+    save_paper_balance(balance + pos['size_usd'] + pos['pnl_usd'])
+
+    log_trade(pos, 'CLOSE', TRADES_LOG)
+    emoji = '🎯' if pnl_pct > 0 else '❌'
+    print(f"{emoji} Paper CLOSED {pos['contract'][:8]}... {reason}: {pnl_pct:+.1f}% (${pos['pnl_usd']:+.2f})")
+
+
+def check_live_exits():
+    """Check all open LIVE positions for exit conditions."""
+    if not swap_executor:
+        return
+
+    positions = load_live_positions()
+    open_contracts = [p['contract'] for p in positions if p['status'] == 'OPEN']
+    if not open_contracts:
+        return
+
+    prices = batch_get_current_prices(open_contracts)
+    if prices:
+        print(f"💰 Live exit check: got prices for {len(prices)}/{len(open_contracts)} open positions")
+    changed = False
+
+    for pos in positions:
+        if pos['status'] != 'OPEN':
+            continue
+
+        current_price = prices.get(pos['contract'])
+        if not current_price:
+            continue
+
+        entry_price = pos['entry_price']
+        entry_time = datetime.fromisoformat(pos['entry_time'])
+        hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+
+        # Update entry price if placeholder
+        if entry_price < 0.000001 and current_price > 0:
+            pos['entry_price'] = current_price
+            pos['initial_stop'] = current_price * HARD_STOP_PCT
+            pos['peak_price'] = current_price
+            entry_price = current_price
+            changed = True
+
+        # Update peak
+        peak_price = pos.get('peak_price', entry_price)
+        if current_price > peak_price:
+            peak_price = current_price
+            pos['peak_price'] = peak_price
+            pos['peak_time'] = datetime.now().isoformat()
+            changed = True
+
+        pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
+        exit_reason = None
+
+        # Trailing stop
+        if current_price > entry_price:
+            trailing_stop = peak_price * (1 - TRAILING_STOP_PCT)
+            pos['trailing_stop'] = trailing_stop
+            if current_price <= trailing_stop:
+                exit_reason = 'TRAILING_STOP'
+
+        # Hard stop
+        if not exit_reason:
+            initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
+            if current_price <= initial_stop:
+                exit_reason = 'STOP_LOSS'
+
+        # Time limit
+        if not exit_reason and hours_held >= TIME_LIMIT_HOURS:
+            exit_reason = 'TIME_LIMIT'
+
+        if exit_reason:
+            close_live_position(pos, current_price, exit_reason, pnl_pct)
+            changed = True
+
+    if changed:
+        save_live_positions(positions)
+
+
+def close_live_position(pos: Dict, exit_price: float, reason: str, pnl_pct: float):
+    """Close a LIVE position with real swap execution."""
+    contract = pos['contract']
+
+    # Check if we actually hold tokens
+    token_bal = get_token_balance(contract)
+    if token_bal == 0:
+        print(f"⚠️ LIVE: No tokens held for {contract[:8]}..., marking as closed (no sell)")
+        pos['status'] = 'CLOSED'
+        pos['exit_price'] = exit_price
+        pos['exit_time'] = datetime.now().isoformat()
+        pos['exit_reason'] = reason + '_NO_TOKENS'
+        pos['pnl_pct'] = -100.0
+        pos['pnl_usd'] = -pos['sol_spent'] * SOL_PRICE_USD
+        pos['sol_received'] = 0
+        pos['tx_sell_sig'] = None
+        log_trade(pos, 'CLOSE', LIVE_TRADES_LOG)
+        return
+
+    # Execute sell
+    print(f"💰 LIVE SELL ({reason}): {contract[:8]}...")
+    try:
+        success, sig_or_err, details = swap_executor.sell_all_token(contract)
+    except Exception as e:
+        print(f"❌ LIVE SELL FAILED (exception): {e}")
+        return
+
+    if not success:
+        print(f"❌ LIVE SELL FAILED: {sig_or_err}")
+        return
+
+    # Calculate actual P&L in SOL
+    sol_received = details.get('out_amount', 0) / 1_000_000_000
+    sol_spent = pos['sol_spent']
+    sol_pnl = sol_received - sol_spent
+
+    pos['status'] = 'CLOSED'
+    pos['exit_price'] = exit_price
+    pos['exit_time'] = datetime.now().isoformat()
+    pos['exit_reason'] = reason
+    pos['pnl_pct'] = pnl_pct
+    pos['sol_received'] = sol_received
+    pos['sol_pnl'] = sol_pnl
+    pos['pnl_usd'] = sol_pnl * SOL_PRICE_USD
+    pos['tx_sell_sig'] = sig_or_err
+    pos['sell_details'] = {
+        'in_amount': details.get('in_amount', 0),
+        'out_amount': details.get('out_amount', 0),
+        'price_impact_pct': details.get('price_impact_pct', '0'),
+        'confirmed': details.get('confirmed', False),
+    }
+
+    entry_time = datetime.fromisoformat(pos['entry_time'])
+    exit_time = datetime.fromisoformat(pos['exit_time'])
+    peak_price = pos.get('peak_price', pos['entry_price'])
+    pos['analytics'] = {
+        'time_in_position_minutes': (exit_time - entry_time).total_seconds() / 60,
+        'peak_gain_pct': ((peak_price / pos['entry_price']) - 1) * 100 if pos['entry_price'] > 0 else 0,
+        'exit_from_peak_pct': ((exit_price / peak_price) - 1) * 100 if peak_price > 0 else 0,
+        'trailing_stop_worked': reason == 'TRAILING_STOP',
+    }
+
+    # Update live balance
+    live_bal = get_live_balance()
+    save_live_balance(live_bal + sol_received)
+
+    log_trade(pos, 'CLOSE', LIVE_TRADES_LOG)
+    emoji = '🎯' if sol_pnl > 0 else '❌'
+    print(f"{emoji} LIVE CLOSED {contract[:8]}... {reason}: {sol_pnl:+.6f} SOL (${sol_pnl * SOL_PRICE_USD:+.2f})")
+
+
+# ─── Async Main Loops ──────────────────────────────────────────────────
+
+async def exit_check_loop():
+    """Run exit checks every EXIT_CHECK_INTERVAL seconds."""
+    while True:
+        try:
+            # Run blocking exit checks in thread pool
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, check_paper_exits)
+            await loop.run_in_executor(None, check_live_exits)
+        except Exception as e:
+            print(f"❌ Exit check error: {e}")
+            traceback.print_exc()
+        await asyncio.sleep(EXIT_CHECK_INTERVAL)
+
+
+async def status_loop():
+    """Print status every STATUS_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(STATUS_INTERVAL)
+        try:
+            paper_positions = load_positions()
+            live_positions = load_live_positions()
+            open_paper = len([p for p in paper_positions if p['status'] == 'OPEN'])
+            open_live = len([p for p in live_positions if p['status'] == 'OPEN'])
+            uptime_min = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds() / 60
+
+            print(f"\n📊 STATUS [{datetime.now().strftime('%H:%M:%S')}] "
+                  f"uptime: {uptime_min:.0f}m | "
+                  f"paper: {open_paper} open | live: {open_live} open | "
+                  f"tokens seen: {stats['tokens_seen']} | "
+                  f"buys: {stats['buys_executed']} ok / {stats['buys_failed']} fail | "
+                  f"reconnects: {stats['ws_reconnects']}")
+        except Exception as e:
+            print(f"⚠️ Status print error: {e}")
+
+
+async def ws_listener():
+    """
+    Connect to PumpPortal WebSocket, subscribe to new tokens, and buy instantly.
+    Reconnects with exponential backoff on disconnect.
+    """
+    delay = RECONNECT_BASE_DELAY
+
+    while True:
+        try:
+            print(f"🔌 Connecting to PumpPortal WebSocket: {WS_URL}")
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10,
+            ) as ws:
+                # Subscribe to new token events
+                subscribe_msg = json.dumps({"method": "subscribeNewToken"})
+                await ws.send(subscribe_msg)
+                print("✅ Subscribed to subscribeNewToken")
+                delay = RECONNECT_BASE_DELAY  # Reset backoff on successful connect
+
+                async for raw_msg in ws:
+                    try:
+                        data = json.loads(raw_msg)
+                    except json.JSONDecodeError:
+                        continue
+
+                    mint = data.get('mint')
+                    if not mint:
+                        continue  # Not a new token event
+
+                    name = data.get('name', 'Unknown')
+                    symbol = data.get('symbol', '???')
+                    stats['tokens_seen'] += 1
+
+                    print(f"\n🆕 NEW TOKEN: {name} ({symbol}) — {mint[:20]}...")
+
+                    # Log signal
+                    log_signal(mint, name, symbol)
+
+                    # Buy in thread pool (blocking I/O)
+                    loop = asyncio.get_event_loop()
+                    try:
+                        await loop.run_in_executor(None, execute_buy, mint, name, symbol)
+                    except Exception as e:
+                        print(f"❌ Buy executor error: {e}")
+                        traceback.print_exc()
+
+        except (websockets.ConnectionClosed, websockets.InvalidURI,
+                websockets.InvalidHandshake, OSError, ConnectionError) as e:
+            stats['ws_reconnects'] += 1
+            print(f"⚠️ WebSocket disconnected: {e}")
+            print(f"   Reconnecting in {delay}s... (attempt #{stats['ws_reconnects']})")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+
+        except Exception as e:
+            stats['ws_reconnects'] += 1
+            print(f"❌ Unexpected WS error: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+
+
+async def main():
+    """Main entry point — run WS listener + exit checker + status printer concurrently."""
+    print(f"\n{'=' * 60}")
+    print(f"🚀 Real-Time WebSocket Memecoin Scanner")
+    print(f"   PumpPortal: {WS_URL}")
+    print(f"   YOLO Mode: Buy everything, trailing stop = risk mgmt")
+    print(f"   Live SOL/trade: {LIVE_SOL_AMOUNT}")
+    print(f"   Trailing stop: {TRAILING_STOP_PCT * 100:.0f}% | Hard stop: -{(1 - HARD_STOP_PCT) * 100:.0f}%")
+    print(f"   Exit check interval: {EXIT_CHECK_INTERVAL}s")
+    print(f"   Max positions: {MAX_POSITIONS}")
+    print(f"   Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 60}\n")
+
+    # Ensure dirs exist
+    (BASE_DIR / 'logs').mkdir(exist_ok=True)
+    (BASE_DIR / 'data').mkdir(exist_ok=True)
+
+    # Init balance files if needed
+    if not BALANCE_FILE.exists():
+        save_paper_balance(PAPER_BALANCE_DEFAULT)
+        print(f"💰 Initialized paper balance: ${PAPER_BALANCE_DEFAULT}")
+
+    if not LIVE_BALANCE_FILE.exists():
+        save_live_balance(0.0)
+        print(f"🔴 Initialized live balance tracking")
+
+    # Run all three loops concurrently
+    await asyncio.gather(
+        ws_listener(),
+        exit_check_loop(),
+        status_loop(),
+    )
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Scanner stopped by user")
+    except Exception as e:
+        print(f"\n💥 Fatal error: {e}")
+        traceback.print_exc()
+        sys.exit(1)

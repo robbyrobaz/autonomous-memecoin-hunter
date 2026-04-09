@@ -1,3 +1,4 @@
+import os
 """
 Jupiter Swap Executor — executes real SOL↔token swaps on Solana mainnet.
 
@@ -209,60 +210,43 @@ def sell_token(token_mint: str, token_amount_raw: int) -> Tuple[bool, str, dict]
 
 
 def sell_all_token(token_mint: str) -> Tuple[bool, str, dict]:
-    """Sell entire token balance back to SOL."""
-    # Route pumpfun tokens through PumpPortal
-    if token_mint.endswith("pump"):
-        try:
-            kp = load_keypair()
-            client = Client(RPC_URL)
-            from solana.rpc.types import TokenAccountOpts
-            resp = client.get_token_accounts_by_owner_json_parsed(
-                kp.pubkey(),
-                TokenAccountOpts(mint=Pubkey.from_string(token_mint)),
-            )
-            if not resp.value:
-                return False, "No token account found", {}
-            account_data = resp.value[0].account.data
-            parsed = json.loads(account_data.to_json())
-            token_amount = int(parsed["parsed"]["info"]["tokenAmount"]["amount"])
-            if token_amount == 0:
-                return False, "Zero token balance", {}
-            print(f"🐸 Routing sell_all to PumpPortal: {token_amount} tokens of {token_mint[:16]}...")
-            result = sell_pumpfun(token_mint, token_amount)
-            if result and result.get("tx_hash"):
-                return True, result["tx_hash"], result
-            return False, "PumpPortal sell_all failed", {}
-        except Exception as e:
-            return False, f"PumpPortal sell_all failed: {e}", {}
-
+    """Sell entire token balance back to SOL. Try PumpPortal first, Jupiter fallback."""
+    # Get token balance first
     try:
         kp = load_keypair()
         client = Client(RPC_URL)
-        
-        # Get token accounts
-        from solders.pubkey import Pubkey
         from solana.rpc.types import TokenAccountOpts
         resp = client.get_token_accounts_by_owner_json_parsed(
             kp.pubkey(),
             TokenAccountOpts(mint=Pubkey.from_string(token_mint)),
         )
-        
         if not resp.value:
             return False, "No token account found", {}
-        
-        # Get balance from first account
         account_data = resp.value[0].account.data
         parsed = json.loads(account_data.to_json())
         token_amount = int(parsed["parsed"]["info"]["tokenAmount"]["amount"])
-        
         if token_amount == 0:
             return False, "Zero token balance", {}
-        
-        print(f"💰 Selling all: {token_amount} raw tokens of {token_mint[:8]}...")
-        return execute_swap(token_mint, SOL_MINT, token_amount)
-        
     except Exception as e:
-        return False, f"sell_all failed: {e}", {}
+        return False, f"Failed to get token balance: {e}", {}
+
+    # Try PumpPortal first
+    print(f"🐸 Trying PumpPortal sell_all: {token_amount} tokens of {token_mint[:16]}...")
+    try:
+        result = sell_pumpfun(token_mint, token_amount)
+        if result and result.get("tx_hash"):
+            return True, result["tx_hash"], result
+        print(f"  PumpPortal sell_all failed, falling back to Jupiter")
+    except Exception as e:
+        print(f"  PumpPortal sell_all error: {e}, falling back to Jupiter")
+
+    # Jupiter fallback (we already have token_amount from above)
+    try:
+        print(f"💰 Jupiter fallback: Selling {token_amount} tokens of {token_mint[:8]}...")
+        time.sleep(1)
+        return execute_swap(token_mint, SOL_MINT, token_amount)
+    except Exception as e:
+        return False, f"Jupiter sell_all failed: {e}", {}
 
 
 if __name__ == "__main__":
