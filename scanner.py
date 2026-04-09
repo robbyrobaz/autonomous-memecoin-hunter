@@ -18,7 +18,7 @@ from telethon import TelegramClient
 from dotenv import load_dotenv
 
 # === LIVE TRADING CONFIG ===
-LIVE_TRADING = True  # Set to False to disable real swaps
+LIVE_TRADING = False  # PAPER ONLY until strategy proves profitable (Apr 8 2026)
 # === YOLO MODE (data-driven, Apr 8 2026) ===
 # Analysis of 25,192 price points across 2,606 contracts:
 # - 72% of missed moonshots (10x+) were killed by rugcheck filters

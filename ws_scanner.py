@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 import websockets
 
 # === CONFIG ===
+LIVE_TRADING = False           # PAPER ONLY until strategy proves profitable (Apr 8 2026)
 LIVE_SOL_AMOUNT = 0.005        # ~$0.65 per trade
 SOL_PRICE_USD = 130.0          # Approximate, for display
 TRAILING_STOP_PCT = 0.12       # 12% below peak
@@ -277,7 +278,7 @@ def execute_buy(mint: str, name: str, symbol: str):
 
     # --- LIVE BUY via PumpPortal ---
     live_buy_result = None
-    if pumpfun_executor:
+    if LIVE_TRADING and pumpfun_executor:
         try:
             sol_balance = swap_executor.get_sol_balance() if swap_executor else 999
             if sol_balance < LIVE_SOL_AMOUNT + 0.002:
@@ -562,7 +563,19 @@ def close_live_position(pos: Dict, exit_price: float, reason: str, pnl_pct: floa
         log_trade(pos, 'CLOSE', LIVE_TRADES_LOG)
         return
 
-    # Execute sell
+    # Execute sell (only if live trading enabled)
+    if not LIVE_TRADING:
+        print(f"📄 LIVE SELL skipped (paper mode): {contract[:8]}...")
+        pos['status'] = 'CLOSED'
+        pos['exit_reason'] = reason
+        pos['exit_price'] = current_price
+        pos['exit_time'] = datetime.now().isoformat()
+        pos['sol_received'] = 0
+        pos['pnl_sol'] = -pos.get('sol_spent', 0)
+        pos['tx_sell_sig'] = None
+        log_trade(pos, 'CLOSE', LIVE_TRADES_LOG)
+        return
+
     print(f"💰 LIVE SELL ({reason}): {contract[:8]}...")
     try:
         success, sig_or_err, details = swap_executor.sell_all_token(contract)
