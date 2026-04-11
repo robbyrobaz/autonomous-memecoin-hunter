@@ -47,6 +47,13 @@ EVAL_TIMEOUT_S     = 600   # Discard token if still unresolved at 10 min
 EVAL_MIN_VOLUME    = 3000  # Min $3k volume in first 3 min to qualify
 EVAL_MIN_PRICE_CHG = 5.0   # OR price up ≥5% in last 5 min (momentum signal)
 
+# === DEAD COIN EXIT ===
+# Exit early if a token has had virtually no trading activity for the past hour.
+# Transaction count beats volume — a single whale can fake volume, not trade count.
+# Only triggers after MIN_HOLD to give the token time to develop.
+DEAD_COIN_MIN_HOLD_MIN  = 60   # Don't check before 60 min — token needs time to develop
+DEAD_COIN_MAX_TXNS_H1   = 3    # Exit if total buys+sells in last 1h < 3 (effectively dead)
+
 # === PATHS ===
 BASE_DIR = Path(__file__).parent
 SIGNALS_LOG = BASE_DIR / 'logs' / 'signals.jsonl'
@@ -251,6 +258,26 @@ def batch_get_current_prices(contracts: List[str]) -> Dict[str, float]:
     return prices
 
 
+def batch_get_market_data(contracts: List[str]) -> Dict[str, dict]:
+    """Get price + txn counts for dead-coin detection. One Dexscreener call."""
+    cache = batch_fetch_dexscreener(contracts)
+    result = {}
+    for contract, pair in cache.items():
+        try:
+            price = float(pair.get('priceUsd', 0) or 0)
+            txns_h1 = pair.get('txns', {}).get('h1', {})
+            txns_h1_total = int(txns_h1.get('buys', 0) or 0) + int(txns_h1.get('sells', 0) or 0)
+            result[contract] = {
+                'price':       price,
+                'txns_h1':     txns_h1_total,
+                'volume_h1':   float((pair.get('volume') or {}).get('h1', 0) or 0),
+                'volume_m5':   float((pair.get('volume') or {}).get('m5', 0) or 0),
+            }
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
 def get_token_balance(contract: str) -> int:
     """Check if we actually hold tokens of a given mint."""
     try:
@@ -406,13 +433,13 @@ def execute_buy(mint: str, name: str, symbol: str):
 
 def check_paper_exits():
     """Check all open paper positions for exit conditions."""
-    # Load positions and fetch prices outside the lock (price fetch is a network call)
+    # Load positions and fetch market data outside the lock (network call)
     positions = load_positions()
     open_contracts = [p['contract'] for p in positions if p['status'] == 'OPEN']
     if not open_contracts:
         return
 
-    prices = batch_get_current_prices(open_contracts)
+    market = batch_get_market_data(open_contracts)
 
     # Re-load inside lock, apply updates, save — prevents race with execute_buy
     with _positions_lock:
@@ -423,13 +450,15 @@ def check_paper_exits():
             if pos['status'] != 'OPEN':
                 continue
 
-            current_price = prices.get(pos['contract'])
+            mdata = market.get(pos['contract'], {})
+            current_price = mdata.get('price', 0)
             if not current_price:
                 continue
 
             entry_price = pos['entry_price']
             entry_time = datetime.fromisoformat(pos['entry_time'])
             hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            mins_held  = hours_held * 60
 
             # Update entry price if it was a placeholder
             if entry_price < 0.000001 and current_price > 0:
@@ -462,6 +491,12 @@ def check_paper_exits():
                 initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
                 if current_price <= initial_stop:
                     exit_reason = 'STOP_LOSS'
+
+            # Dead coin: < 3 total transactions in last hour after 60+ min hold
+            if not exit_reason and mins_held >= DEAD_COIN_MIN_HOLD_MIN:
+                txns_h1 = mdata.get('txns_h1', 999)
+                if txns_h1 < DEAD_COIN_MAX_TXNS_H1:
+                    exit_reason = 'DEAD_COIN'
 
             # Time limit
             if not exit_reason and hours_held >= TIME_LIMIT_HOURS:
