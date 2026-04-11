@@ -80,8 +80,9 @@ except ImportError as e:
 # === STATS ===
 stats = {
     'tokens_seen': 0,
-    'buys_executed': 0,
-    'buys_failed': 0,
+    'buys_paper': 0,     # successful paper opens
+    'buys_live': 0,      # successful live buys (0 while LIVE_TRADING=False)
+    'buys_skipped': 0,   # passed filter but blocked (max positions / dedup)
     'ws_reconnects': 0,
     'filtered_out': 0,
     'start_time': datetime.now().isoformat(),
@@ -91,6 +92,9 @@ stats = {
 # mint → {seen_at: float, name: str, symbol: str}
 # Tokens wait here until EVAL_DELAY_S before Dexscreener check fires.
 _pending: Dict[str, dict] = {}
+
+# All mints ever queued this session — prevents re-buying on WS reconnect
+_ever_queued: set = set()
 
 
 # ─── Position Management (mirrors scanner.py) ──────────────────────────
@@ -282,12 +286,14 @@ def execute_buy(mint: str, name: str, symbol: str):
 
     if open_paper >= MAX_POSITIONS:
         print(f"⚠️ Max paper positions ({MAX_POSITIONS}) reached, skip {mint[:12]}...")
+        stats['buys_skipped'] += 1
         return False
 
     # Check if already in this token (paper)
     for p in positions:
         if p['contract'] == mint and p['status'] == 'OPEN':
             print(f"⚠️ Already have paper position in {mint[:12]}...")
+            stats['buys_skipped'] += 1
             return False
 
     # --- LIVE BUY via PumpPortal ---
@@ -343,6 +349,7 @@ def execute_buy(mint: str, name: str, symbol: str):
     save_paper_balance(balance - POSITION_SIZE)
 
     log_trade(paper_pos, 'OPEN', TRADES_LOG)
+    stats['buys_paper'] += 1
     print(f"📝 Paper OPENED: {name} ({symbol}) {mint[:12]}...")
 
     # --- LIVE POSITION ---
@@ -379,12 +386,10 @@ def execute_buy(mint: str, name: str, symbol: str):
         save_live_balance(live_bal - LIVE_SOL_AMOUNT)
 
         log_trade(live_pos, 'OPEN', LIVE_TRADES_LOG)
+        stats['buys_live'] += 1
         print(f"🔴 LIVE OPENED: {name} ({symbol}) {mint[:12]}... tx: {live_buy_result['tx_hash'][:20]}...")
-        stats['buys_executed'] += 1
-    else:
-        stats['buys_failed'] += 1
-        if pumpfun_executor:
-            print(f"❌ LIVE BUY failed for {mint[:12]}...")
+    elif LIVE_TRADING and pumpfun_executor:
+        print(f"❌ LIVE BUY failed for {mint[:12]}...")
 
     return True
 
@@ -672,7 +677,7 @@ async def status_loop():
                   f"uptime: {uptime_min:.0f}m | "
                   f"paper: {open_paper} open | live: {open_live} open | "
                   f"seen: {stats['tokens_seen']} | pending: {len(_pending)} | "
-                  f"buys: {stats['buys_executed']} ok / {stats['buys_failed']} fail | "
+                  f"paper buys: {stats['buys_paper']} | skipped: {stats['buys_skipped']} | "
                   f"filtered: {stats['filtered_out']} | "
                   f"reconnects: {stats['ws_reconnects']}")
         except Exception as e:
@@ -791,7 +796,9 @@ async def ws_listener():
                     log_signal(mint, name, symbol)
 
                     # Queue for traction-filtered evaluation in EVAL_DELAY_S seconds
-                    if mint not in _pending:
+                    # _ever_queued prevents re-queuing on WS reconnect (avoids duplicate trades)
+                    if mint not in _pending and mint not in _ever_queued:
+                        _ever_queued.add(mint)
                         _pending[mint] = {
                             'seen_at': time.time(),
                             'name': name,

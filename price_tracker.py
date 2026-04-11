@@ -26,8 +26,8 @@ BATCH_DELAY = 1.0  # seconds between API calls
 DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana/{addresses}"
 
 # Early snapshot: capture price 3-15 min after signal (before regular ~17min cycle)
-EARLY_SNAP_AFTER_S   = 180   # 3 min — don't fetch before token is discoverable
-EARLY_SNAP_TIMEOUT_S = 900   # 15 min — drop from early queue if we missed the window
+EARLY_SNAP_AFTER_S   = 180    # 3 min — don't fetch before token is discoverable
+EARLY_SNAP_TIMEOUT_S = 2400   # 40 min — main cycle takes ~22 min; keep until next check
 
 # ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
