@@ -2,10 +2,9 @@
 """
 Real-Time WebSocket Memecoin Scanner — PumpPortal New Token Stream
 
-Connects to wss://pumpportal.fun/api/data and instantly buys every new token
-created on PumpFun. YOLO mode — trailing stop is the only risk management.
-
-Replaces the 5-minute cron polling with instant real-time buying.
+Connects to wss://pumpportal.fun/api/data and queues new tokens for
+ML-filtered evaluation before opening paper positions.
+Entry filter: volume ≥ $3k OR price up ≥5% at 3 min. Trailing stop exit.
 """
 
 import asyncio
@@ -16,6 +15,7 @@ import time
 import threading
 import traceback
 import requests
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -101,8 +101,22 @@ stats = {
 # Tokens wait here until EVAL_DELAY_S before Dexscreener check fires.
 _pending: Dict[str, dict] = {}
 
-# All mints ever queued this session — prevents re-buying on WS reconnect
+# All mints ever queued this session — prevents re-buying on WS reconnect.
+# Capped at 500k entries with FIFO eviction to prevent unbounded memory growth
+# over multi-day runs (500 tokens/5min × 1440 min/day ≈ 144k/day × 3.5 days fits).
+_EVER_QUEUED_MAX = 500_000
 _ever_queued: set = set()
+_ever_queued_queue: deque = deque()  # FIFO for eviction order
+
+
+def _ever_queued_add(mint: str) -> None:
+    if mint in _ever_queued:
+        return
+    if len(_ever_queued) >= _EVER_QUEUED_MAX:
+        old = _ever_queued_queue.popleft()
+        _ever_queued.discard(old)
+    _ever_queued.add(mint)
+    _ever_queued_queue.append(mint)
 
 # Lock for paper positions file — prevents race between evaluation_loop (execute_buy)
 # and exit_check_loop (check_paper_exits) both writing positions.tmp simultaneously.
@@ -647,7 +661,7 @@ def close_live_position(pos: Dict, exit_price: float, reason: str, pnl_pct: floa
         print(f"📄 LIVE SELL skipped (paper mode): {contract[:8]}...")
         pos['status'] = 'CLOSED'
         pos['exit_reason'] = reason
-        pos['exit_price'] = current_price
+        pos['exit_price'] = exit_price
         pos['exit_time'] = datetime.now().isoformat()
         pos['sol_received'] = 0
         pos['pnl_sol'] = -pos.get('sol_spent', 0)
@@ -858,7 +872,7 @@ async def ws_listener():
                     # Queue for traction-filtered evaluation in EVAL_DELAY_S seconds
                     # _ever_queued prevents re-queuing on WS reconnect (avoids duplicate trades)
                     if mint not in _pending and mint not in _ever_queued:
-                        _ever_queued.add(mint)
+                        _ever_queued_add(mint)
                         _pending[mint] = {
                             'seen_at': time.time(),
                             'name': name,
