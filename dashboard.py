@@ -24,8 +24,7 @@ REJECTIONS_LOG = BASE_DIR / 'logs' / 'rejections.jsonl'
 STARTING_BALANCE = 100.0
 SOL_PRICE_USD = 130.0  # Approximate
 
-# V4 YOLO + WS scanner epoch — only show trades from this point forward
-# Old data preserved in files, dashboard filters to fresh YOLO run
+# V4 epoch — WS scanner start; only show trades from this point forward
 V4_EPOCH = '2026-04-08T18:00:00'
 
 def load_balance():
@@ -198,7 +197,7 @@ def api_data():
     """Main API endpoint for paper trading dashboard data — V4 epoch only"""
     positions = load_positions()
 
-    # Filter to V4 epoch only (fresh YOLO + WS scanner run)
+    # Filter to V4 epoch only
     positions = [p for p in positions if p.get('entry_time', '') >= V4_EPOCH]
 
     open_positions = [p for p in positions if p.get('status') == 'OPEN']
@@ -543,7 +542,7 @@ TEMPLATE = '''
 </head>
 <body>
     <div class="container">
-        <h1>&#x1F916; Autonomous Memecoin Hunter <span style="font-size:14px;color:#f59e0b;background:#f59e0b20;padding:3px 10px;border-radius:12px;">V4 YOLO</span></h1>
+        <h1>&#x1F916; Autonomous Memecoin Hunter <span style="font-size:14px;color:#f59e0b;background:#f59e0b20;padding:3px 10px;border-radius:12px;">V4 ML Filter</span></h1>
         <div class="status" id="status">Loading...</div>
 
         <!-- ===== LIVE TRADING SECTION ===== -->
@@ -574,10 +573,10 @@ TEMPLATE = '''
 
         <!-- ===== PAPER TRADING SECTION ===== -->
         <h2 style="color:#fff;margin-bottom:15px;display:flex;align-items:center;">
-            &#x1F4C4; Paper Trading <span class="paper-label">V4 YOLO + WS (Real-Time)</span>
+            &#x1F4C4; Paper Trading <span class="paper-label">V4 ML Filter (Real-Time)</span>
         </h2>
         <div style="color:#888;font-size:13px;margin-bottom:20px;">
-            PumpPortal WebSocket &bull; No filters &bull; 12% trailing stop &bull; Buy everything, let winners run
+            PumpPortal WebSocket &bull; 3-min eval: vol&thinsp;&ge;&thinsp;$3k <em>or</em> &Delta;5m&thinsp;&ge;&thinsp;5% &bull; 12% trailing stop &bull; 70% hard stop &bull; 6h time limit
         </div>
 
         <div class="metrics" id="metrics"></div>
