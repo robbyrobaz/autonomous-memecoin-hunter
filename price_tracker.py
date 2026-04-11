@@ -29,6 +29,10 @@ DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana/{addresses}"
 EARLY_SNAP_AFTER_S   = 180    # 3 min — don't fetch before token is discoverable
 EARLY_SNAP_TIMEOUT_S = 2400   # 40 min — main cycle takes ~22 min; keep until next check
 
+# Snapshot file rotation: trim entries older than KEEP_DAYS when file exceeds MAX_SIZE_MB
+SNAPSHOT_MAX_SIZE_MB = 400    # trigger trim above 400 MB
+SNAPSHOT_KEEP_DAYS   = 7      # keep 7 days of snapshots (~560 MB at current rate)
+
 # ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -101,6 +105,46 @@ def expire_old_contracts() -> int:
     for c in expired:
         del tracked_contracts[c]
     return len(expired)
+
+
+def trim_old_snapshots() -> None:
+    """Remove snapshot entries older than SNAPSHOT_KEEP_DAYS when file exceeds SNAPSHOT_MAX_SIZE_MB.
+    Rewrites the file atomically via a tmp file. Runs at startup and periodically during operation.
+    """
+    if not SNAPSHOTS_FILE.exists():
+        return
+    size_mb = SNAPSHOTS_FILE.stat().st_size / (1024 * 1024)
+    if size_mb < SNAPSHOT_MAX_SIZE_MB:
+        return
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)).isoformat()
+    kept = []
+    dropped = 0
+    with open(SNAPSHOTS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                snap = json.loads(line)
+                if snap.get("timestamp", "") >= cutoff:
+                    kept.append(line)
+                else:
+                    dropped += 1
+            except json.JSONDecodeError:
+                pass  # drop malformed lines silently
+
+    tmp = SNAPSHOTS_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for line in kept:
+            f.write(line + "\n")
+    tmp.rename(SNAPSHOTS_FILE)
+
+    new_mb = SNAPSHOTS_FILE.stat().st_size / (1024 * 1024)
+    log.info(
+        "Snapshot trim: %.0f MB → %.0f MB (%d entries dropped, %d kept, %d-day window)",
+        size_mb, new_mb, dropped, len(kept), SNAPSHOT_KEEP_DAYS,
+    )
 
 
 def fetch_prices(addresses: list[str]) -> list[dict]:
@@ -295,13 +339,22 @@ def main():
     # Ensure data dir exists
     SNAPSHOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+    # Trim stale snapshots at startup (file can grow to ~79 MB/day; trim to 7-day window)
+    trim_old_snapshots()
+
     # Initial load
     new = load_signals(initial=True)
     expired = expire_old_contracts()
     log.info("Initial load: %d contracts loaded, %d already expired", new, expired)
 
+    cycles = 0
     while True:
+        cycles += 1
         try:
+            # Periodic snapshot trim: once every 288 cycles (~24h at 5-min intervals)
+            if cycles % 288 == 0:
+                trim_old_snapshots()
+
             # Check for new signals
             new_signals = load_signals(initial=False)
             if new_signals:
