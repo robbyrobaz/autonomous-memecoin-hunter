@@ -216,8 +216,15 @@ def batch_fetch_dexscreener(contracts: List[str]) -> Dict[str, Dict]:
         try:
             joined = ','.join(chunk)
             url = f"https://api.dexscreener.com/tokens/v1/solana/{joined}"
-            resp = requests.get(url, timeout=15)
 
+            resp = None
+            for retry_delay in (0, 5, 15):
+                if retry_delay:
+                    time.sleep(retry_delay)
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 429:
+                    break
+                print(f"⚠️ Dexscreener 429 — retrying in {5 if retry_delay == 0 else 15}s")
             if resp.status_code != 200:
                 print(f"⚠️ Dexscreener batch error: {resp.status_code}")
                 continue
