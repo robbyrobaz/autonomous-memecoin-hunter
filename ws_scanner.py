@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import threading
 import traceback
 import requests
 from datetime import datetime, timedelta
@@ -95,6 +96,10 @@ _pending: Dict[str, dict] = {}
 
 # All mints ever queued this session — prevents re-buying on WS reconnect
 _ever_queued: set = set()
+
+# Lock for paper positions file — prevents race between evaluation_loop (execute_buy)
+# and exit_check_loop (check_paper_exits) both writing positions.tmp simultaneously.
+_positions_lock = threading.Lock()
 
 
 # ─── Position Management (mirrors scanner.py) ──────────────────────────
@@ -278,7 +283,7 @@ def execute_buy(mint: str, name: str, symbol: str):
     """
     now = datetime.now()
 
-    # Check position limits
+    # Pre-check position limits (outside lock — quick rejection before any network calls)
     positions = load_positions()
     open_paper = len([p for p in positions if p['status'] == 'OPEN'])
     live_positions = load_live_positions()
@@ -342,8 +347,11 @@ def execute_buy(mint: str, name: str, symbol: str):
         },
         'source': 'ws_scanner',
     }
-    positions.append(paper_pos)
-    save_positions(positions)
+    # Lock covers load→append→save to prevent race with check_paper_exits thread
+    with _positions_lock:
+        positions = load_positions()  # Re-load inside lock for fresh state
+        positions.append(paper_pos)
+        save_positions(positions)
 
     balance = get_paper_balance()
     save_paper_balance(balance - POSITION_SIZE)
@@ -398,69 +406,73 @@ def execute_buy(mint: str, name: str, symbol: str):
 
 def check_paper_exits():
     """Check all open paper positions for exit conditions."""
+    # Load positions and fetch prices outside the lock (price fetch is a network call)
     positions = load_positions()
     open_contracts = [p['contract'] for p in positions if p['status'] == 'OPEN']
     if not open_contracts:
         return
 
     prices = batch_get_current_prices(open_contracts)
-    changed = False
 
-    for pos in positions:
-        if pos['status'] != 'OPEN':
-            continue
+    # Re-load inside lock, apply updates, save — prevents race with execute_buy
+    with _positions_lock:
+        positions = load_positions()
+        changed = False
 
-        current_price = prices.get(pos['contract'])
-        if not current_price:
-            continue
+        for pos in positions:
+            if pos['status'] != 'OPEN':
+                continue
 
-        entry_price = pos['entry_price']
-        entry_time = datetime.fromisoformat(pos['entry_time'])
-        hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            current_price = prices.get(pos['contract'])
+            if not current_price:
+                continue
 
-        # Update entry price if it was a placeholder
-        if entry_price < 0.000001 and current_price > 0:
-            pos['entry_price'] = current_price
-            pos['initial_stop'] = current_price * HARD_STOP_PCT
-            pos['peak_price'] = current_price
-            entry_price = current_price
-            changed = True
+            entry_price = pos['entry_price']
+            entry_time = datetime.fromisoformat(pos['entry_time'])
+            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
 
-        # Update peak
-        peak_price = pos.get('peak_price', entry_price)
-        if current_price > peak_price:
-            peak_price = current_price
-            pos['peak_price'] = peak_price
-            pos['peak_time'] = datetime.now().isoformat()
-            changed = True
+            # Update entry price if it was a placeholder
+            if entry_price < 0.000001 and current_price > 0:
+                pos['entry_price'] = current_price
+                pos['initial_stop'] = current_price * HARD_STOP_PCT
+                pos['peak_price'] = current_price
+                entry_price = current_price
+                changed = True
 
-        pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
-        exit_reason = None
+            # Update peak
+            peak_price = pos.get('peak_price', entry_price)
+            if current_price > peak_price:
+                peak_price = current_price
+                pos['peak_price'] = peak_price
+                pos['peak_time'] = datetime.now().isoformat()
+                changed = True
 
-        # Trailing stop
-        if current_price > entry_price:
-            trailing_stop = peak_price * (1 - TRAILING_STOP_PCT)
-            pos['trailing_stop'] = trailing_stop
-            if current_price <= trailing_stop:
-                exit_reason = 'TRAILING_STOP'
+            pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
+            exit_reason = None
 
-        # Hard stop
-        if not exit_reason:
-            initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
-            if current_price <= initial_stop:
-                exit_reason = 'STOP_LOSS'
+            # Trailing stop
+            if current_price > entry_price:
+                trailing_stop = peak_price * (1 - TRAILING_STOP_PCT)
+                pos['trailing_stop'] = trailing_stop
+                if current_price <= trailing_stop:
+                    exit_reason = 'TRAILING_STOP'
 
-        # Time limit
-        if not exit_reason and hours_held >= TIME_LIMIT_HOURS:
-            exit_reason = 'TIME_LIMIT'
+            # Hard stop
+            if not exit_reason:
+                initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
+                if current_price <= initial_stop:
+                    exit_reason = 'STOP_LOSS'
 
-        if exit_reason:
-            close_paper_position(pos, current_price, exit_reason, pnl_pct)
-            changed = True
+            # Time limit
+            if not exit_reason and hours_held >= TIME_LIMIT_HOURS:
+                exit_reason = 'TIME_LIMIT'
 
-    if changed:
-        # Re-save all positions with updates
-        save_positions(positions)
+            if exit_reason:
+                close_paper_position(pos, current_price, exit_reason, pnl_pct)
+                changed = True
+
+        if changed:
+            save_positions(positions)
 
 
 def close_paper_position(pos: Dict, exit_price: float, reason: str, pnl_pct: float):
