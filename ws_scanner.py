@@ -265,8 +265,13 @@ def batch_get_market_data(contracts: List[str]) -> Dict[str, dict]:
     for contract, pair in cache.items():
         try:
             price = float(pair.get('priceUsd', 0) or 0)
-            txns_h1 = pair.get('txns', {}).get('h1', {})
-            txns_h1_total = int(txns_h1.get('buys', 0) or 0) + int(txns_h1.get('sells', 0) or 0)
+            # Use None when txns.h1 is absent — distinguishes "no data" from "0 trades".
+            # Missing data must NOT trigger DEAD_COIN (false positive risk).
+            txns_raw = (pair.get('txns') or {}).get('h1')
+            txns_h1_total = (
+                None if txns_raw is None
+                else int(txns_raw.get('buys', 0) or 0) + int(txns_raw.get('sells', 0) or 0)
+            )
             result[contract] = {
                 'price':       price,
                 'txns_h1':     txns_h1_total,
@@ -492,10 +497,11 @@ def check_paper_exits():
                 if current_price <= initial_stop:
                     exit_reason = 'STOP_LOSS'
 
-            # Dead coin: < 3 total transactions in last hour after 60+ min hold
+            # Dead coin: < 3 total transactions in last hour after 60+ min hold.
+            # txns_h1=None means Dexscreener didn't return h1 data — skip to avoid false positives.
             if not exit_reason and mins_held >= DEAD_COIN_MIN_HOLD_MIN:
-                txns_h1 = mdata.get('txns_h1', 999)
-                if txns_h1 < DEAD_COIN_MAX_TXNS_H1:
+                txns_h1 = mdata.get('txns_h1')
+                if txns_h1 is not None and txns_h1 < DEAD_COIN_MAX_TXNS_H1:
                     exit_reason = 'DEAD_COIN'
 
             # Time limit
