@@ -38,6 +38,14 @@ WS_URL = "wss://pumpportal.fun/api/data"
 RECONNECT_BASE_DELAY = 2       # Starting reconnect delay (seconds)
 RECONNECT_MAX_DELAY = 120      # Max reconnect delay
 
+# === ENTRY FILTER (ML-derived, Apr 2026) ===
+# Don't buy instantly — wait EVAL_DELAY_S, then check Dexscreener.
+# Tokens with real traction at 3 min have 35-49% win rate vs 14% baseline.
+EVAL_DELAY_S       = 180   # Wait 3 min before evaluating (seconds)
+EVAL_TIMEOUT_S     = 600   # Discard token if still unresolved at 10 min
+EVAL_MIN_VOLUME    = 3000  # Min $3k volume in first 3 min to qualify
+EVAL_MIN_PRICE_CHG = 5.0   # OR price up ≥5% in last 5 min (momentum signal)
+
 # === PATHS ===
 BASE_DIR = Path(__file__).parent
 SIGNALS_LOG = BASE_DIR / 'logs' / 'signals.jsonl'
@@ -75,8 +83,14 @@ stats = {
     'buys_executed': 0,
     'buys_failed': 0,
     'ws_reconnects': 0,
+    'filtered_out': 0,
     'start_time': datetime.now().isoformat(),
 }
+
+# === PENDING EVALUATION QUEUE ===
+# mint → {seen_at: float, name: str, symbol: str}
+# Tokens wait here until EVAL_DELAY_S before Dexscreener check fires.
+_pending: Dict[str, dict] = {}
 
 
 # ─── Position Management (mirrors scanner.py) ──────────────────────────
@@ -148,13 +162,13 @@ def save_paper_balance(balance: float):
 # ─── Logging (mirrors scanner.py) ──────────────────────────────────────
 
 def log_signal(contract: str, name: str, symbol: str):
-    """Log detected signal"""
+    """Log detected signal — stores full message, not a truncated snippet."""
     data = {
         'timestamp': datetime.now().isoformat(),
         'contract': contract,
         'score': 0,
         'channel': 'pumpportal_ws',
-        'message_snippet': f"New token: {name} ({symbol}) — {contract[:16]}..."
+        'message': f"New PumpFun token: {name} ({symbol}) — {contract}",
     }
     with open(SIGNALS_LOG, 'a') as f:
         f.write(json.dumps(data) + '\n')
@@ -657,16 +671,89 @@ async def status_loop():
             print(f"\n📊 STATUS [{datetime.now().strftime('%H:%M:%S')}] "
                   f"uptime: {uptime_min:.0f}m | "
                   f"paper: {open_paper} open | live: {open_live} open | "
-                  f"tokens seen: {stats['tokens_seen']} | "
+                  f"seen: {stats['tokens_seen']} | pending: {len(_pending)} | "
                   f"buys: {stats['buys_executed']} ok / {stats['buys_failed']} fail | "
+                  f"filtered: {stats['filtered_out']} | "
                   f"reconnects: {stats['ws_reconnects']}")
         except Exception as e:
             print(f"⚠️ Status print error: {e}")
 
 
+async def evaluation_loop():
+    """
+    Every 60s, evaluate pending tokens that have aged past EVAL_DELAY_S.
+    Fetch Dexscreener data and buy only tokens meeting volume/momentum thresholds.
+    Discard tokens older than EVAL_TIMEOUT_S.
+
+    ML finding (Apr 2026, 1,236 closed trades):
+      - Buy-everything baseline: 14.5% win rate
+      - score≥3 AND holders>150 filter:  35.1% win rate (+$9.94 on 94 trades)
+    Proxy used here: Dexscreener volume_24h (all trading since launch) and
+    priceChange.m5 as traction signals, since holder count requires rugcheck API.
+    """
+    while True:
+        await asyncio.sleep(60)
+        if not _pending:
+            continue
+
+        now = time.time()
+        to_evaluate = [m for m, d in list(_pending.items())
+                       if now - d['seen_at'] >= EVAL_DELAY_S]
+        to_discard  = [m for m, d in list(_pending.items())
+                       if now - d['seen_at'] >= EVAL_TIMEOUT_S]
+
+        # Discard timed-out tokens first
+        for mint in to_discard:
+            entry = _pending.pop(mint, None)
+            if entry:
+                age_m = (now - entry['seen_at']) / 60
+                print(f"  ⏭ EVAL timeout ({age_m:.0f}m): {entry['name']} ({entry['symbol']}) {mint[:12]}...")
+                stats['filtered_out'] += 1
+
+        if not to_evaluate:
+            continue
+
+        print(f"\n🔍 EVAL: checking {len(to_evaluate)} pending token(s)...")
+        loop = asyncio.get_event_loop()
+        try:
+            dex_data = await loop.run_in_executor(
+                None, batch_fetch_dexscreener, to_evaluate
+            )
+        except Exception as e:
+            print(f"  ❌ EVAL Dexscreener error: {e}")
+            continue
+
+        for mint in to_evaluate:
+            if mint not in _pending:
+                continue  # already discarded above
+            entry = _pending.pop(mint)
+            pair = dex_data.get(mint, {})
+
+            volume   = float((pair.get('volume') or {}).get('h24', 0) or 0)
+            price_ch = float((pair.get('priceChange') or {}).get('m5', 0) or 0)
+            liq      = float((pair.get('liquidity') or {}).get('usd', 0) or 0)
+            age_m    = (now - entry['seen_at']) / 60
+
+            passes = volume >= EVAL_MIN_VOLUME or price_ch >= EVAL_MIN_PRICE_CHG
+
+            if passes:
+                print(f"  ✅ EVAL PASS  {entry['name']:20s}  vol=${volume:,.0f}  "
+                      f"Δ5m={price_ch:+.1f}%  liq=${liq:,.0f}  age={age_m:.1f}m")
+                try:
+                    await loop.run_in_executor(
+                        None, execute_buy, mint, entry['name'], entry['symbol']
+                    )
+                except Exception as e:
+                    print(f"  ❌ EVAL buy error: {e}")
+            else:
+                print(f"  ❌ EVAL FAIL  {entry['name']:20s}  vol=${volume:,.0f}  "
+                      f"Δ5m={price_ch:+.1f}%  liq=${liq:,.0f}  age={age_m:.1f}m  — skipped")
+                stats['filtered_out'] += 1
+
+
 async def ws_listener():
     """
-    Connect to PumpPortal WebSocket, subscribe to new tokens, and buy instantly.
+    Connect to PumpPortal WebSocket, subscribe to new tokens, queue for evaluation.
     Reconnects with exponential backoff on disconnect.
     """
     delay = RECONNECT_BASE_DELAY
@@ -700,18 +787,18 @@ async def ws_listener():
                     symbol = data.get('symbol', '???')
                     stats['tokens_seen'] += 1
 
-                    print(f"\n🆕 NEW TOKEN: {name} ({symbol}) — {mint[:20]}...")
-
-                    # Log signal
+                    # Log signal immediately (before filter decision)
                     log_signal(mint, name, symbol)
 
-                    # Buy in thread pool (blocking I/O)
-                    loop = asyncio.get_event_loop()
-                    try:
-                        await loop.run_in_executor(None, execute_buy, mint, name, symbol)
-                    except Exception as e:
-                        print(f"❌ Buy executor error: {e}")
-                        traceback.print_exc()
+                    # Queue for traction-filtered evaluation in EVAL_DELAY_S seconds
+                    if mint not in _pending:
+                        _pending[mint] = {
+                            'seen_at': time.time(),
+                            'name': name,
+                            'symbol': symbol,
+                        }
+                        print(f"  ⏳ QUEUED: {name} ({symbol}) {mint[:16]}... "
+                              f"(eval in {EVAL_DELAY_S//60}m)")
 
         except (websockets.ConnectionClosed, websockets.InvalidURI,
                 websockets.InvalidHandshake, OSError, ConnectionError) as e:
@@ -734,9 +821,10 @@ async def main():
     print(f"\n{'=' * 60}")
     print(f"🚀 Real-Time WebSocket Memecoin Scanner")
     print(f"   PumpPortal: {WS_URL}")
-    print(f"   YOLO Mode: Buy everything, trailing stop = risk mgmt")
+    print(f"   Mode: ML-filtered entry (eval at {EVAL_DELAY_S}s, timeout {EVAL_TIMEOUT_S}s)")
     print(f"   Live SOL/trade: {LIVE_SOL_AMOUNT}")
     print(f"   Trailing stop: {TRAILING_STOP_PCT * 100:.0f}% | Hard stop: -{(1 - HARD_STOP_PCT) * 100:.0f}%")
+    print(f"   Entry filter: vol≥${EVAL_MIN_VOLUME:,} OR Δ5m≥{EVAL_MIN_PRICE_CHG}% at {EVAL_DELAY_S//60}m")
     print(f"   Exit check interval: {EXIT_CHECK_INTERVAL}s")
     print(f"   Max positions: {MAX_POSITIONS}")
     print(f"   Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -755,9 +843,10 @@ async def main():
         save_live_balance(0.0)
         print(f"🔴 Initialized live balance tracking")
 
-    # Run all three loops concurrently
+    # Run all four loops concurrently
     await asyncio.gather(
         ws_listener(),
+        evaluation_loop(),
         exit_check_loop(),
         status_loop(),
     )

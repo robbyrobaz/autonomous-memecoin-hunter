@@ -770,7 +770,7 @@ def log_signal(contract: str, score: int, channel: str, message: str):
         'contract': contract,
         'score': score,
         'channel': channel,
-        'message_snippet': message[:200]
+        'message': message
     }
     
     with open(SIGNALS_LOG, 'a') as f:
