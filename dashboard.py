@@ -308,6 +308,7 @@ def api_data():
         'worst_trade': worst_trade,
         'channels': channels_list,
         'balance_history': balance_history,
+        'filter_change_ts': '2026-04-10T22:49:43',  # ML entry filter added (commit bc4010b)
         'last_update': datetime.now().isoformat()
     })
 
@@ -839,15 +840,59 @@ TEMPLATE = '''
             document.getElementById('channels').innerHTML = html;
         }
 
-        function renderBalanceChart(history) {
+        function renderBalanceChart(history, filterChangeTs) {
             const ctx = document.getElementById('balanceChart').getContext('2d');
             if (balanceChart) balanceChart.destroy();
 
             const labels = history.map((h, i) => i === 0 ? 'Start' : `Trade ${i}`);
             const data = history.map(h => h.balance);
 
+            // Find the first trade index at or after the filter change timestamp
+            let filterIdx = -1;
+            if (filterChangeTs) {
+                filterIdx = history.findIndex(h => h.time && h.time >= filterChangeTs);
+            }
+
+            // Inline plugin: draws a vertical amber dashed line + label at filterIdx
+            const filterAnnotationPlugin = {
+                id: 'filterAnnotation',
+                afterDraw(chart) {
+                    if (filterIdx < 0 || filterIdx >= chart.data.labels.length) return;
+                    const meta = chart.getDatasetMeta(0);
+                    const point = meta.data[filterIdx];
+                    if (!point) return;
+                    const x = point.x;
+                    const top = chart.chartArea.top;
+                    const bottom = chart.chartArea.bottom;
+                    const c = chart.ctx;
+                    c.save();
+                    c.setLineDash([5, 4]);
+                    c.strokeStyle = '#f59e0b';
+                    c.lineWidth = 2;
+                    c.beginPath();
+                    c.moveTo(x, top);
+                    c.lineTo(x, bottom);
+                    c.stroke();
+                    c.setLineDash([]);
+                    // Label pill
+                    const label = 'Filter v4';
+                    c.font = 'bold 10px sans-serif';
+                    const tw = c.measureText(label).width;
+                    const px = 6, py = 3;
+                    const rx = x + 5, ry = top + 8;
+                    c.fillStyle = '#f59e0b';
+                    c.beginPath();
+                    c.roundRect(rx, ry, tw + px * 2, 16 + py, 3);
+                    c.fill();
+                    c.fillStyle = '#000';
+                    c.fillText(label, rx + px, ry + 12);
+                    c.restore();
+                }
+            };
+
             balanceChart = new Chart(ctx, {
                 type: 'line',
+                plugins: [filterAnnotationPlugin],
                 data: {
                     labels: labels,
                     datasets: [{
@@ -890,7 +935,7 @@ TEMPLATE = '''
                 renderOpenPositions(paperData.open_positions);
                 renderClosedTrades(paperData.closed_positions);
                 renderChannels(paperData.channels);
-                renderBalanceChart(paperData.balance_history);
+                renderBalanceChart(paperData.balance_history, paperData.filter_change_ts);
 
             } catch (err) {
                 console.error('Error fetching data:', err);
