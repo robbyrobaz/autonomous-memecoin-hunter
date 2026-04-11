@@ -234,8 +234,11 @@ def api_data():
         pos['token_name'] = extract_token_name(pos)
         pos['time_ago'] = time_ago(pos.get('exit_time', pos['entry_time']))
 
-    open_positions_value = sum(pos.get('size_usd', 0) + pos.get('current_pnl_usd', 0) for pos in open_positions)
-    total_portfolio_value = balance + open_positions_value
+    # Only add unrealized PnL from open positions — their initial capital was already
+    # deducted from balance when opened (balance is computed from closed-trade PnL only,
+    # so adding size_usd here would double-count the deployed capital)
+    open_unrealized_pnl = sum(pos.get('current_pnl_usd', 0) for pos in open_positions)
+    total_portfolio_value = balance + open_unrealized_pnl
     total_pnl = total_portfolio_value - STARTING_BALANCE
     total_pnl_pct = (total_pnl / STARTING_BALANCE) * 100
 
