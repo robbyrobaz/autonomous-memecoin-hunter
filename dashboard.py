@@ -843,7 +843,14 @@ TEMPLATE = '''
             const ctx = document.getElementById('balanceChart').getContext('2d');
             if (balanceChart) balanceChart.destroy();
 
-            const labels = history.map((h, i) => i === 0 ? 'Start' : `Trade ${i}`);
+            // Format timestamps as "Apr 8 18:30" — blank for start point
+            function fmtTime(iso) {
+                if (!iso || iso === 0) return 'Start';
+                const d = new Date(iso);
+                return d.toLocaleDateString('en-US', {month:'short', day:'numeric'})
+                    + ' ' + d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false});
+            }
+            const labels = history.map(h => fmtTime(h.time));
             const data = history.map(h => h.balance);
 
             // Find the first trade index at or after the filter change timestamp
@@ -906,10 +913,31 @@ TEMPLATE = '''
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
+                    animation: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                title: items => labels[items[0].dataIndex],
+                                label: item => ` $${item.raw.toFixed(2)}`
+                            }
+                        }
+                    },
+                    elements: { point: { radius: 0, hoverRadius: 4 } },
                     scales: {
-                        y: { ticks: { color: '#888' }, grid: { color: '#1f2937' } },
-                        x: { ticks: { color: '#888' }, grid: { color: '#1f2937' } }
+                        y: {
+                            ticks: { color: '#888', callback: v => '$' + v.toFixed(2) },
+                            grid: { color: '#1f2937' }
+                        },
+                        x: {
+                            ticks: {
+                                color: '#888',
+                                autoSkip: true,
+                                maxTicksLimit: 10,
+                                maxRotation: 30,
+                            },
+                            grid: { color: '#1f2937' }
+                        }
                     }
                 }
             });
