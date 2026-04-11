@@ -93,22 +93,31 @@ def expire_old_contracts() -> int:
 
 
 def fetch_prices(addresses: list[str]) -> list[dict]:
-    """Fetch prices from Dexscreener for a batch of addresses."""
+    """Fetch prices from Dexscreener for a batch of addresses. Retries on 429."""
     url = DEXSCREENER_URL.format(addresses=",".join(addresses))
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        # API returns a list of pair objects directly
-        if isinstance(data, list):
-            return data
-        # Sometimes wrapped in an object
-        if isinstance(data, dict):
-            return data.get("pairs", data.get("data", []))
-        return []
-    except requests.exceptions.RequestException as e:
-        log.error("Dexscreener API error: %s", e)
-        return []
+    backoffs = [5, 15, 30]
+    for attempt, wait in enumerate([0] + backoffs):
+        if wait:
+            time.sleep(wait)
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 429:
+                if attempt < len(backoffs):
+                    log.warning("Dexscreener 429 — retrying in %ds (attempt %d)", backoffs[attempt], attempt + 1)
+                    continue
+                log.error("Dexscreener 429 — giving up after %d retries", len(backoffs))
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("pairs", data.get("data", []))
+            return []
+        except requests.exceptions.RequestException as e:
+            log.error("Dexscreener API error: %s", e)
+            return []
+    return []
 
 
 def safe_float(val) -> float:
