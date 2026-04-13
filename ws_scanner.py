@@ -503,6 +503,20 @@ def check_paper_exits():
 
     market = batch_get_market_data(open_contracts)
 
+    # Collect price ticks for backtesting OUTSIDE the lock (file I/O, not position state)
+    now_str = datetime.now().isoformat(timespec='seconds')
+    price_ticks = []
+    for contract in open_contracts:
+        price = (market.get(contract) or {}).get('price', 0)
+        if price:
+            price_ticks.append({'c': contract, 't': now_str, 'p': price})
+    if price_ticks:
+        try:
+            with open(PRICE_PATHS_LOG, 'a') as _ppf:
+                _ppf.write('\n'.join(json.dumps(t) for t in price_ticks) + '\n')
+        except Exception:
+            pass
+
     # Re-load inside lock, apply updates, save — prevents race with execute_buy
     with _positions_lock:
         positions = load_positions()
@@ -516,17 +530,6 @@ def check_paper_exits():
             current_price = mdata.get('price', 0)
             if not current_price:
                 continue
-
-            # Record price tick for backtesting (30s resolution price path)
-            try:
-                with open(PRICE_PATHS_LOG, 'a') as _ppf:
-                    _ppf.write(json.dumps({
-                        'c': pos['contract'],
-                        't': datetime.now().isoformat(timespec='seconds'),
-                        'p': current_price,
-                    }) + '\n')
-            except Exception:
-                pass
 
             entry_price = pos['entry_price']
             entry_time = datetime.fromisoformat(pos['entry_time'])
@@ -924,7 +927,12 @@ async def ws_listener():
                         _ever_queued_add(mint)
                         print(f"  🚀 BUY AT LAUNCH: {name} ({symbol}) {mint[:16]}...")
                         loop = asyncio.get_event_loop()
-                        loop.run_in_executor(None, execute_buy, mint, name, symbol)
+                        def _buy_safe(m=mint, n=name, s=symbol):
+                            try:
+                                execute_buy(m, n, s)
+                            except Exception as e:
+                                print(f"  ❌ execute_buy exception [{n}]: {e}")
+                        loop.run_in_executor(None, _buy_safe)
 
         except (websockets.ConnectionClosed, websockets.InvalidURI,
                 websockets.InvalidHandshake, OSError, ConnectionError) as e:
