@@ -26,12 +26,12 @@ import websockets
 LIVE_TRADING = False           # PAPER ONLY until strategy proves profitable (Apr 8 2026)
 LIVE_SOL_AMOUNT = 0.005        # ~$0.65 per trade
 SOL_PRICE_USD = 130.0          # Approximate, for display
-TRAILING_STOP_PCT = 0.12       # 12% below peak
-HARD_STOP_PCT = 0.30           # entry_price * 0.30 = -70% hard stop
+TRAILING_STOP_PCT = 0.10       # 10% below peak (backtest: tighter = better)
+HARD_STOP_PCT = 0.50           # entry_price * 0.50 = -50% hard stop
 TIME_LIMIT_HOURS = 6           # Max hold time
-MAX_POSITIONS = 100            # Max concurrent positions
+MAX_POSITIONS = 500            # Paper: ~23 tokens/min × 20min DEAD_COIN hold = ~460 steady-state
 POSITION_SIZE = 1.0            # $1 paper position
-PAPER_BALANCE_DEFAULT = 100.0
+PAPER_BALANCE_DEFAULT = 1000.0  # Raised to match higher position cap
 
 EXIT_CHECK_INTERVAL = 30       # Seconds between exit checks
 STATUS_INTERVAL = 60           # Seconds between status prints
@@ -51,7 +51,7 @@ EVAL_MIN_PRICE_CHG = 5.0   # OR price up ≥5% in last 5 min (momentum signal)
 # Exit early if a token has had virtually no trading activity for the past hour.
 # Transaction count beats volume — a single whale can fake volume, not trade count.
 # Only triggers after MIN_HOLD to give the token time to develop.
-DEAD_COIN_MIN_HOLD_MIN  = 60   # Don't check before 60 min — token needs time to develop
+DEAD_COIN_MIN_HOLD_MIN  = 20   # Don't check before 20 min — gives token time to develop
 DEAD_COIN_MAX_TXNS_H1   = 3    # Exit if total buys+sells in last 1h < 3 (effectively dead)
 
 # === PATHS ===
@@ -63,6 +63,7 @@ POSITIONS_FILE = BASE_DIR / 'data' / 'positions.json'
 LIVE_POSITIONS_FILE = BASE_DIR / 'data' / 'live_positions.json'
 LIVE_BALANCE_FILE = BASE_DIR / 'data' / 'live_balance.txt'
 BALANCE_FILE = BASE_DIR / 'data' / 'balance.txt'
+PRICE_PATHS_LOG = BASE_DIR / 'logs' / 'price_paths.jsonl'  # 30s price ticks for backtesting
 
 # === LOAD ENV ===
 from dotenv import load_dotenv
@@ -122,6 +123,14 @@ def _ever_queued_add(mint: str) -> None:
 # and exit_check_loop (check_paper_exits) both writing positions.tmp simultaneously.
 _positions_lock = threading.Lock()
 
+# Lock for trade/signal log files — prevents interleaved JSONL writes when
+# exit_check_loop and evaluation_loop both call log_trade from separate threads.
+_log_lock = threading.Lock()
+
+# Lock for paper balance file — prevents lost balance updates when two threads
+# concurrently read-modify-write balance.txt.
+_balance_lock = threading.Lock()
+
 
 # ─── Position Management (mirrors scanner.py) ──────────────────────────
 
@@ -141,7 +150,15 @@ def save_positions(positions: List[Dict]):
     tmp = POSITIONS_FILE.with_suffix('.tmp')
     with open(tmp, 'w') as f:
         json.dump(positions, f, indent=2)
-    tmp.rename(POSITIONS_FILE)
+    try:
+        tmp.rename(POSITIONS_FILE)
+    except FileNotFoundError:
+        # Rare race: another thread already renamed the .tmp file.
+        # Re-write and rename once more under the assumption the lock
+        # wasn't held correctly (defensive fallback).
+        with open(tmp, 'w') as f:
+            json.dump(positions, f, indent=2)
+        tmp.rename(POSITIONS_FILE)
 
 
 def load_live_positions() -> List[Dict]:
@@ -189,6 +206,20 @@ def save_paper_balance(balance: float):
     BALANCE_FILE.write_text(str(round(balance, 4)))
 
 
+def deduct_paper_balance(amount: float) -> None:
+    """Thread-safe read-modify-write on paper balance."""
+    with _balance_lock:
+        bal = get_paper_balance()
+        save_paper_balance(bal - amount)
+
+
+def credit_paper_balance(amount: float) -> None:
+    """Thread-safe credit of paper balance on position close."""
+    with _balance_lock:
+        bal = get_paper_balance()
+        save_paper_balance(bal + amount)
+
+
 # ─── Logging (mirrors scanner.py) ──────────────────────────────────────
 
 def log_signal(contract: str, name: str, symbol: str):
@@ -200,19 +231,22 @@ def log_signal(contract: str, name: str, symbol: str):
         'channel': 'pumpportal_ws',
         'message': f"New PumpFun token: {name} ({symbol}) — {contract}",
     }
-    with open(SIGNALS_LOG, 'a') as f:
-        f.write(json.dumps(data) + '\n')
+    with _log_lock:
+        with open(SIGNALS_LOG, 'a') as f:
+            f.write(json.dumps(data) + '\n')
 
 
 def log_trade(position: Dict, action: str, log_file: Path):
-    """Log trade action"""
+    """Log trade action. Uses _log_lock to prevent interleaved JSONL writes
+    from exit_check_loop and evaluation_loop running in separate threads."""
     data = {
         'timestamp': datetime.now().isoformat(),
         'action': action,
         **position
     }
-    with open(log_file, 'a') as f:
-        f.write(json.dumps(data) + '\n')
+    with _log_lock:
+        with open(log_file, 'a') as f:
+            f.write(json.dumps(data) + '\n')
 
 
 # ─── Dexscreener Batch Price Fetch (mirrors scanner.py) ────────────────
@@ -329,10 +363,11 @@ def get_token_balance(contract: str) -> int:
 
 # ─── Buy Logic ──────────────────────────────────────────────────────────
 
-def execute_buy(mint: str, name: str, symbol: str):
+def execute_buy(mint: str, name: str, symbol: str, eval_metrics: dict | None = None):
     """
     Buy a new token: live buy via PumpPortal, open paper + live positions.
     Runs synchronously (called from async via run_in_executor).
+    eval_metrics: dict with volume, price_ch, liq, age_m, filter_branch from eval loop.
     """
     now = datetime.now()
 
@@ -392,11 +427,13 @@ def execute_buy(mint: str, name: str, symbol: str):
         'signal_data': signal_data,
         'market_data': {'token_name': name, 'token_symbol': symbol},
         'entry_metrics': {
-            'liquidity': 0,
-            'volume_24h': 0,
+            'liquidity': eval_metrics.get('liq', 0) if eval_metrics else 0,
+            'volume_24h': eval_metrics.get('volume', 0) if eval_metrics else 0,
+            'price_change_5m': eval_metrics.get('price_ch', 0) if eval_metrics else 0,
+            'filter_branch': eval_metrics.get('filter_branch', 'unknown') if eval_metrics else 'unknown',
             'rugcheck_score': 0,
             'holder_count': 0,
-            'age_hours': 0,
+            'age_hours': eval_metrics.get('age_m', 0) / 60 if eval_metrics else 0,
         },
         'source': 'ws_scanner',
     }
@@ -406,8 +443,7 @@ def execute_buy(mint: str, name: str, symbol: str):
         positions.append(paper_pos)
         save_positions(positions)
 
-    balance = get_paper_balance()
-    save_paper_balance(balance - POSITION_SIZE)
+    deduct_paper_balance(POSITION_SIZE)
 
     log_trade(paper_pos, 'OPEN', TRADES_LOG)
     stats['buys_paper'] += 1
@@ -481,6 +517,17 @@ def check_paper_exits():
             if not current_price:
                 continue
 
+            # Record price tick for backtesting (30s resolution price path)
+            try:
+                with open(PRICE_PATHS_LOG, 'a') as _ppf:
+                    _ppf.write(json.dumps({
+                        'c': pos['contract'],
+                        't': datetime.now().isoformat(timespec='seconds'),
+                        'p': current_price,
+                    }) + '\n')
+            except Exception:
+                pass
+
             entry_price = pos['entry_price']
             entry_time = datetime.fromisoformat(pos['entry_time'])
             hours_held = (datetime.now() - entry_time).total_seconds() / 3600
@@ -489,7 +536,6 @@ def check_paper_exits():
             # Update entry price if it was a placeholder
             if entry_price < 0.000001 and current_price > 0:
                 pos['entry_price'] = current_price
-                pos['initial_stop'] = current_price * HARD_STOP_PCT
                 pos['peak_price'] = current_price
                 entry_price = current_price
                 changed = True
@@ -505,20 +551,17 @@ def check_paper_exits():
             pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
             exit_reason = None
 
-            # Trailing stop
+            # Trailing stop — two separate steps:
+            # 1) Update stop level (only moves up, only when price is above entry)
             if current_price > entry_price:
-                trailing_stop = peak_price * (1 - TRAILING_STOP_PCT)
-                pos['trailing_stop'] = trailing_stop
-                if current_price <= trailing_stop:
+                new_trail = peak_price * (1 - TRAILING_STOP_PCT)
+                pos['trailing_stop'] = new_trail
+            # 2) Fire check (always — catches tokens that crash BELOW entry after a pump)
+            if not exit_reason and pos.get('trailing_stop') is not None:
+                if current_price <= pos['trailing_stop']:
                     exit_reason = 'TRAILING_STOP'
 
-            # Hard stop
-            if not exit_reason:
-                initial_stop = pos.get('initial_stop', entry_price * HARD_STOP_PCT)
-                if current_price <= initial_stop:
-                    exit_reason = 'STOP_LOSS'
-
-            # Dead coin: < 3 total transactions in last hour after 60+ min hold.
+            # Dead coin: < 3 total transactions in last hour after 20+ min hold.
             # txns_h1=None means Dexscreener didn't return h1 data — skip to avoid false positives.
             if not exit_reason and mins_held >= DEAD_COIN_MIN_HOLD_MIN:
                 txns_h1 = mdata.get('txns_h1')
@@ -557,9 +600,8 @@ def close_paper_position(pos: Dict, exit_price: float, reason: str, pnl_pct: flo
         'trailing_stop_worked': reason == 'TRAILING_STOP',
     }
 
-    # Update balance
-    balance = get_paper_balance()
-    save_paper_balance(balance + pos['size_usd'] + pos['pnl_usd'])
+    # Update balance (thread-safe: exit_check_loop and evaluation_loop both call this)
+    credit_paper_balance(pos['size_usd'] + pos['pnl_usd'])
 
     log_trade(pos, 'CLOSE', TRADES_LOG)
     emoji = '🎯' if pnl_pct > 0 else '❌'
@@ -813,14 +855,21 @@ async def evaluation_loop():
             liq      = float((pair.get('liquidity') or {}).get('usd', 0) or 0)
             age_m    = (now - entry['seen_at']) / 60
 
-            passes = volume >= EVAL_MIN_VOLUME or price_ch >= EVAL_MIN_PRICE_CHG
+            # Volume branch: token has real traction AND is not already dumping
+            # Momentum branch: strong upward price action alone qualifies
+            vol_pass = volume >= EVAL_MIN_VOLUME and price_ch >= 0
+            mom_pass = price_ch >= EVAL_MIN_PRICE_CHG
+            passes = vol_pass or mom_pass
+            filter_branch = 'volume' if vol_pass else 'momentum'
 
             if passes:
                 print(f"  ✅ EVAL PASS  {entry['name']:20s}  vol=${volume:,.0f}  "
-                      f"Δ5m={price_ch:+.1f}%  liq=${liq:,.0f}  age={age_m:.1f}m")
+                      f"Δ5m={price_ch:+.1f}%  liq=${liq:,.0f}  age={age_m:.1f}m  [{filter_branch}]")
                 try:
                     await loop.run_in_executor(
-                        None, execute_buy, mint, entry['name'], entry['symbol']
+                        None, execute_buy, mint, entry['name'], entry['symbol'],
+                        {'volume': volume, 'price_ch': price_ch, 'liq': liq,
+                         'age_m': age_m, 'filter_branch': filter_branch}
                     )
                 except Exception as e:
                     print(f"  ❌ EVAL buy error: {e}")
@@ -866,20 +915,16 @@ async def ws_listener():
                     symbol = data.get('symbol', '???')
                     stats['tokens_seen'] += 1
 
-                    # Log signal immediately (before filter decision)
+                    # Log signal immediately
                     log_signal(mint, name, symbol)
 
-                    # Queue for traction-filtered evaluation in EVAL_DELAY_S seconds
-                    # _ever_queued prevents re-queuing on WS reconnect (avoids duplicate trades)
-                    if mint not in _pending and mint not in _ever_queued:
+                    # Buy immediately at launch — trailing stop handles all exits.
+                    # _ever_queued prevents re-buying on WS reconnect.
+                    if mint not in _ever_queued:
                         _ever_queued_add(mint)
-                        _pending[mint] = {
-                            'seen_at': time.time(),
-                            'name': name,
-                            'symbol': symbol,
-                        }
-                        print(f"  ⏳ QUEUED: {name} ({symbol}) {mint[:16]}... "
-                              f"(eval in {EVAL_DELAY_S//60}m)")
+                        print(f"  🚀 BUY AT LAUNCH: {name} ({symbol}) {mint[:16]}...")
+                        loop = asyncio.get_event_loop()
+                        loop.run_in_executor(None, execute_buy, mint, name, symbol)
 
         except (websockets.ConnectionClosed, websockets.InvalidURI,
                 websockets.InvalidHandshake, OSError, ConnectionError) as e:
@@ -902,10 +947,10 @@ async def main():
     print(f"\n{'=' * 60}")
     print(f"🚀 Real-Time WebSocket Memecoin Scanner")
     print(f"   PumpPortal: {WS_URL}")
-    print(f"   Mode: ML-filtered entry (eval at {EVAL_DELAY_S}s, timeout {EVAL_TIMEOUT_S}s)")
+    print(f"   Mode: BUY AT LAUNCH — no eval delay, trailing stop exits only")
     print(f"   Live SOL/trade: {LIVE_SOL_AMOUNT}")
-    print(f"   Trailing stop: {TRAILING_STOP_PCT * 100:.0f}% | Hard stop: -{(1 - HARD_STOP_PCT) * 100:.0f}%")
-    print(f"   Entry filter: vol≥${EVAL_MIN_VOLUME:,} OR Δ5m≥{EVAL_MIN_PRICE_CHG}% at {EVAL_DELAY_S//60}m")
+    print(f"   Trailing stop: {TRAILING_STOP_PCT * 100:.0f}% below peak | Hard stop: DISABLED")
+    print(f"   Entry filter: NONE — buying every PumpPortal launch")
     print(f"   Exit check interval: {EXIT_CHECK_INTERVAL}s")
     print(f"   Max positions: {MAX_POSITIONS}")
     print(f"   Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -924,10 +969,9 @@ async def main():
         save_live_balance(0.0)
         print(f"🔴 Initialized live balance tracking")
 
-    # Run all four loops concurrently
+    # Run loops concurrently (evaluation_loop removed — buying at launch now)
     await asyncio.gather(
         ws_listener(),
-        evaluation_loop(),
         exit_check_loop(),
         status_loop(),
     )
