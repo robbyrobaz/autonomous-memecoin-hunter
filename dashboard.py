@@ -337,6 +337,25 @@ def api_data():
                 'balance': round(running_balance, 2)
             })
 
+    # ROI by hour-of-day (0–23): avg pnl_pct of all trades closed in that hour
+    _roi_buckets: dict = defaultdict(list)
+    for p in closed_positions:
+        et = p.get('exit_time', '')
+        if len(et) >= 13:
+            try:
+                hour = int(et[11:13])
+                _roi_buckets[hour].append(p.get('pnl_pct', 0))
+            except ValueError:
+                pass
+    roi_by_hour = []
+    for h in range(24):
+        pnls = _roi_buckets.get(h, [])
+        roi_by_hour.append({
+            'hour': h,
+            'avg_roi': round(sum(pnls) / len(pnls), 2) if pnls else 0,
+            'count': len(pnls),
+        })
+
     return jsonify({
         'balance': balance,
         'open_positions': open_positions,
@@ -360,6 +379,7 @@ def api_data():
         'worst_trade': worst_trade,
         'channels': channels_list,
         'balance_history': balance_history,
+        'roi_by_hour': roi_by_hour,
         'filter_change_ts': '2026-04-10T22:49:43',  # ML entry filter added (commit bc4010b)
         'last_update': datetime.now().isoformat()
     })
@@ -642,6 +662,13 @@ TEMPLATE = '''
         </div>
 
         <div class="section">
+            <div class="section-title">&#x23F1; Avg ROI % by Hour of Day <span style="font-size:12px;color:#888;font-weight:normal;margin-left:8px;">UTC — all closed trades</span></div>
+            <div class="chart-container" style="height:220px;">
+                <canvas id="roiHourChart"></canvas>
+            </div>
+        </div>
+
+        <div class="section">
             <div class="section-title">&#x1F525; Open Positions (<span id="open-count">0</span>)</div>
             <div id="open-positions"></div>
         </div>
@@ -659,6 +686,7 @@ TEMPLATE = '''
 
     <script>
         let balanceChart = null;
+        let roiHourChart = null;
         const SOL_PRICE = 130;
 
         function formatMoney(val) {
@@ -996,6 +1024,62 @@ TEMPLATE = '''
             });
         }
 
+        function renderRoiHourChart(roiByHour) {
+            const ctx = document.getElementById('roiHourChart').getContext('2d');
+            if (roiHourChart) roiHourChart.destroy();
+
+            const labels = roiByHour.map(d => d.hour.toString().padStart(2,'0') + ':00');
+            const values = roiByHour.map(d => d.avg_roi);
+            const counts = roiByHour.map(d => d.count);
+            const colors = values.map(v => v >= 0 ? '#10b98199' : '#ef444499');
+            const borderColors = values.map(v => v >= 0 ? '#10b981' : '#ef4444');
+
+            roiHourChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: 'Avg ROI %',
+                        data: values,
+                        backgroundColor: colors,
+                        borderColor: borderColors,
+                        borderWidth: 1,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                title: items => labels[items[0].dataIndex] + ' UTC',
+                                label: item => [
+                                    ` Avg ROI: ${item.raw >= 0 ? '+' : ''}${item.raw.toFixed(2)}%`,
+                                    ` Trades: ${counts[item.dataIndex]}`
+                                ]
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            ticks: {
+                                color: '#888',
+                                callback: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+                            },
+                            grid: { color: '#1f2937' },
+                            border: { dash: [3, 3] }
+                        },
+                        x: {
+                            ticks: { color: '#888', font: { size: 10 } },
+                            grid: { color: '#1f293720' }
+                        }
+                    }
+                }
+            });
+        }
+
         async function fetchData() {
             try {
                 // Fetch both live and paper data
@@ -1016,6 +1100,7 @@ TEMPLATE = '''
                 renderClosedTrades(paperData.closed_positions);
                 renderChannels(paperData.channels);
                 renderBalanceChart(paperData.balance_history, paperData.filter_change_ts);
+                renderRoiHourChart(paperData.roi_by_hour);
 
             } catch (err) {
                 console.error('Error fetching data:', err);
