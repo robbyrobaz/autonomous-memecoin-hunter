@@ -7,6 +7,7 @@ Real-time view of paper trading + LIVE trading performance
 from flask import Flask, jsonify, render_template_string
 from pathlib import Path
 import json
+import time
 from datetime import datetime
 from collections import defaultdict
 
@@ -23,6 +24,14 @@ REJECTIONS_LOG = BASE_DIR / 'logs' / 'rejections.jsonl'
 
 STARTING_BALANCE = 100.0
 SOL_PRICE_USD = 130.0  # Approximate
+
+# Cache for paper_trades.jsonl CLOSE records — reading 20MB+ JSONL on every request is too slow
+_closed_trades_cache: list = []
+_closed_trades_cache_mtime: float = 0.0
+
+# Cache for signals count — signals.jsonl is 47MB+, only need the count
+_signals_count_cache: int = 0
+_signals_count_mtime: float = 0.0
 
 # V4 epoch — WS scanner start; only show trades from this point forward
 V4_EPOCH = '2026-04-08T18:00:00'
@@ -43,6 +52,52 @@ def load_live_positions():
         with open(LIVE_POSITIONS_FILE) as f:
             return json.load(f)
     return []
+
+def load_signals_count_cached() -> int:
+    """Count V4-epoch signals from signals.jsonl, re-reading only when file changes.
+    Uses string scan (no JSON parsing) to stay fast on 47MB+ files."""
+    global _signals_count_cache, _signals_count_mtime
+    try:
+        mtime = SIGNALS_LOG.stat().st_mtime
+    except FileNotFoundError:
+        return 0
+    if mtime == _signals_count_mtime:
+        return _signals_count_cache
+    count = 0
+    v4_prefix = f'"timestamp": "{V4_EPOCH[:10]}'  # e.g. '"timestamp": "2026-04-08'
+    with open(SIGNALS_LOG) as f:
+        for line in f:
+            # Quick string check: timestamp field must be >= V4_EPOCH date
+            ts_idx = line.find('"timestamp": "')
+            if ts_idx >= 0:
+                ts = line[ts_idx + 14: ts_idx + 33]  # 19-char ISO datetime
+                if ts >= V4_EPOCH:
+                    count += 1
+    _signals_count_cache = count
+    _signals_count_mtime = mtime
+    return count
+
+def load_closed_trades_cached() -> list:
+    """Load CLOSE records from paper_trades.jsonl, re-reading only when the file changes."""
+    global _closed_trades_cache, _closed_trades_cache_mtime
+    try:
+        mtime = TRADES_LOG.stat().st_mtime
+    except FileNotFoundError:
+        return []
+    if mtime == _closed_trades_cache_mtime:
+        return _closed_trades_cache
+    result = []
+    with open(TRADES_LOG) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                if r.get('action') == 'CLOSE' and r.get('entry_time', '') >= V4_EPOCH:
+                    result.append(r)
+            except Exception:
+                pass
+    _closed_trades_cache = result
+    _closed_trades_cache_mtime = mtime
+    return result
 
 def load_jsonl(filepath):
     if not filepath.exists():
@@ -201,28 +256,26 @@ def api_data():
     positions = [p for p in positions if p.get('entry_time', '') >= V4_EPOCH]
 
     open_positions = [p for p in positions if p.get('status') == 'OPEN']
-    closed_positions = [p for p in positions if p.get('status') == 'CLOSED']
+
+    # Load closed positions from paper_trades.jsonl (full history — positions.json
+    # is trimmed to last 1,000 CLOSED to bound file size). mtime-cached so the
+    # 20MB+ file is only re-parsed when new trades are appended.
+    closed_positions = load_closed_trades_cached()
 
     # Calculate V4-era balance: start from $100 + all closed P&L
     v4_pnl = sum(p.get('pnl_usd', 0) for p in closed_positions)
     balance = STARTING_BALANCE + v4_pnl
 
-    signals = load_jsonl(SIGNALS_LOG)
-    # Filter signals to V4 epoch
-    signals = [s for s in signals if s.get('timestamp', '') >= V4_EPOCH]
+    signals_count = load_signals_count_cached()
     rejections = []  # Don't load huge rejections file, not needed for display
 
     for pos in open_positions:
         pos['token_name'] = extract_token_name(pos)
-        current_price = get_current_price(pos['contract'])
-        if current_price:
-            pos['current_price'] = current_price
-            pos['current_pnl_pct'] = (current_price / pos['entry_price'] - 1) * 100
-            pos['current_pnl_usd'] = pos['size_usd'] * (pos['current_pnl_pct'] / 100)
-        else:
-            pos['current_price'] = pos['entry_price']
-            pos['current_pnl_pct'] = 0
-            pos['current_pnl_usd'] = 0
+        # Skip live Dexscreener lookup — with 300+ open positions it causes 30s+ latency.
+        # ws_scanner.py tracks live prices every 30s; dashboard shows entry price only.
+        pos['current_price'] = pos.get('entry_price', 0)
+        pos['current_pnl_pct'] = 0
+        pos['current_pnl_usd'] = 0
 
         entry_time = datetime.fromisoformat(pos['entry_time'])
         hours_held = (datetime.now() - entry_time).total_seconds() / 3600
@@ -291,9 +344,9 @@ def api_data():
         'starting_balance': STARTING_BALANCE,
         'total_pnl': total_pnl,
         'total_pnl_pct': total_pnl_pct,
-        'total_signals': len(signals),
+        'total_signals': signals_count,
         'total_rejections': len(rejections),
-        'total_trades': len(positions),
+        'total_trades': len(open_positions) + len(closed_positions),
         'open_count': len(open_positions),
         'closed_count': len(closed_positions),
         'win_rate': round(win_rate, 1),

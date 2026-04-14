@@ -146,10 +146,16 @@ def load_positions() -> List[Dict]:
 
 
 def save_positions(positions: List[Dict]):
-    """Save paper positions (atomic write)"""
+    """Save paper positions (atomic write). Trims CLOSED to last 1,000 to prevent
+    unbounded file growth — full history is preserved in logs/paper_trades.jsonl."""
+    open_pos = [p for p in positions if p.get('status') == 'OPEN']
+    closed_pos = [p for p in positions if p.get('status') != 'OPEN']
+    if len(closed_pos) > 1000:
+        closed_pos = closed_pos[-1000:]
+    trimmed = open_pos + closed_pos
     tmp = POSITIONS_FILE.with_suffix('.tmp')
     with open(tmp, 'w') as f:
-        json.dump(positions, f, indent=2)
+        json.dump(trimmed, f, indent=2)
     try:
         tmp.rename(POSITIONS_FILE)
     except FileNotFoundError:
@@ -157,7 +163,7 @@ def save_positions(positions: List[Dict]):
         # Re-write and rename once more under the assumption the lock
         # wasn't held correctly (defensive fallback).
         with open(tmp, 'w') as f:
-            json.dump(positions, f, indent=2)
+            json.dump(trimmed, f, indent=2)
         tmp.rename(POSITIONS_FILE)
 
 
