@@ -54,6 +54,17 @@ EVAL_MIN_PRICE_CHG = 5.0   # OR price up ≥5% in last 5 min (momentum signal)
 DEAD_COIN_MIN_HOLD_MIN  = 20   # Don't check before 20 min — gives token time to develop
 DEAD_COIN_MAX_TXNS_H1   = 3    # Exit if total buys+sells in last 1h < 3 (effectively dead)
 
+# === NO MOMENTUM EXIT ===
+# 73% of PumpFun tokens pump+dump in the first 30s. By the time we get the first
+# Dexscreener price (tick 0, ~30s post-launch), most are already at/past peak.
+# These tokens exit DEAD_COIN after 20min at avg -12.6% loss. Instead: if at 90s
+# (tick 3) the token has never shown any upward movement AND is down 5%, bail now.
+# price_paths.jsonl backtest (Apr 13): 405 correct early exits (avg saves 13.2%),
+# only 7 false exits (tokens that later became >30% winners). EV: -0.84% → +0.28%.
+NO_MOMENTUM_SECS      = 90    # 3 ticks (3×30s) before declaring no momentum
+NO_MOMENTUM_PEAK_PCT  = 1.02  # Token must never have peaked >2% above entry to qualify
+NO_MOMENTUM_EXIT_PCT  = 0.95  # Exit if price < entry * 0.95 (currently down 5%+)
+
 # === PATHS ===
 BASE_DIR = Path(__file__).parent
 SIGNALS_LOG = BASE_DIR / 'logs' / 'signals.jsonl'
@@ -569,6 +580,14 @@ def check_paper_exits():
             if not exit_reason and pos.get('trailing_stop') is not None:
                 if current_price <= pos['trailing_stop']:
                     exit_reason = 'TRAILING_STOP'
+
+            # NO_MOMENTUM: bail fast if token never showed upward movement after 90s
+            if not exit_reason:
+                age_secs = (datetime.now() - entry_time).total_seconds()
+                if (age_secs > NO_MOMENTUM_SECS
+                        and pos.get('peak_price', entry_price) <= entry_price * NO_MOMENTUM_PEAK_PCT
+                        and current_price < entry_price * NO_MOMENTUM_EXIT_PCT):
+                    exit_reason = 'NO_MOMENTUM'
 
             # Dead coin: < 3 total transactions in last hour after 20+ min hold.
             # txns_h1=None means Dexscreener didn't return h1 data — skip to avoid false positives.

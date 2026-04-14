@@ -390,6 +390,7 @@ def api_data():
             {'ts': '2026-04-10 22:49', 'label': 'ML filter ON',      'color': '#f59e0b'},
             {'ts': '2026-04-11 07:39', 'label': 'DEAD_COIN added',   'color': '#60a5fa'},
             {'ts': '2026-04-13 16:57', 'label': 'TS fix / no stop',  'color': '#10b981'},
+            {'ts': '2026-04-13 19:13', 'label': 'NO_MOMENTUM exit',  'color': '#a78bfa'},
         ],
         'filter_change_ts': '2026-04-10T22:49:43',  # ML entry filter added (commit bc4010b)
         'last_update': datetime.now().isoformat()
