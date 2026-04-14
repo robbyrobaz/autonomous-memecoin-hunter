@@ -386,6 +386,11 @@ def api_data():
         'channels': channels_list,
         'balance_history': balance_history,
         'roi_by_hour': roi_by_hour,
+        'roi_change_events': [
+            {'ts': '2026-04-10 22:49', 'label': 'ML filter ON',      'color': '#f59e0b'},
+            {'ts': '2026-04-11 07:39', 'label': 'DEAD_COIN added',   'color': '#60a5fa'},
+            {'ts': '2026-04-13 16:57', 'label': 'TS fix / no stop',  'color': '#10b981'},
+        ],
         'filter_change_ts': '2026-04-10T22:49:43',  # ML entry filter added (commit bc4010b)
         'last_update': datetime.now().isoformat()
     })
@@ -1030,32 +1035,72 @@ TEMPLATE = '''
             });
         }
 
-        function renderRoiHourChart(roiByHour) {
+        function renderRoiHourChart(roiByHour, changeEvents) {
             const ctx = document.getElementById('roiHourChart').getContext('2d');
             if (roiHourChart) roiHourChart.destroy();
 
             // Format "2026-04-13 12:00" → "Apr 13 12:00"
             function fmtBucket(s) {
                 if (!s) return '';
-                const d = new Date(s.replace(' ', 'T') + ':00Z');
+                const parts = s.split(/[\s:-]/);
+                const d = new Date(Date.UTC(+parts[0], +parts[1]-1, +parts[2], +parts[3], +parts[4]));
                 return d.toLocaleDateString('en-US', {month:'short', day:'numeric', timeZone:'UTC'})
                      + ' ' + s.slice(11, 16);
             }
 
             const labels = roiByHour.map(d => fmtBucket(d.label));
+            const bucketKeys = roiByHour.map(d => d.label);   // "2026-04-13 12:00"
             const values = roiByHour.map(d => d.avg_roi);
             const counts = roiByHour.map(d => d.count);
-            const colors = values.map(v => v >= 0 ? '#10b98199' : '#ef444499');
+            const barColors = values.map(v => v >= 0 ? '#10b98180' : '#ef444480');
             const borderColors = values.map(v => v >= 0 ? '#10b981' : '#ef4444');
+
+            // Map each change event to the first bucket index whose key >= event ts
+            const annotations = (changeEvents || []).map(ev => {
+                const idx = bucketKeys.findIndex(k => k >= ev.ts.slice(0, 16));
+                return { idx, label: ev.label, color: ev.color };
+            }).filter(a => a.idx >= 0);
+
+            const changePlugin = {
+                id: 'changeLines',
+                afterDraw(chart) {
+                    const c = chart.ctx;
+                    const { top, bottom } = chart.chartArea;
+                    annotations.forEach(({ idx, label, color }) => {
+                        const meta = chart.getDatasetMeta(0);
+                        const pt = meta.data[idx];
+                        if (!pt) return;
+                        const x = pt.x - (meta.data[1] ? (meta.data[1].x - meta.data[0].x) / 2 : 0);
+                        c.save();
+                        c.setLineDash([5, 4]);
+                        c.strokeStyle = color;
+                        c.lineWidth = 1.5;
+                        c.beginPath(); c.moveTo(x, top); c.lineTo(x, bottom); c.stroke();
+                        c.setLineDash([]);
+                        // Pill label
+                        c.font = 'bold 10px sans-serif';
+                        const tw = c.measureText(label).width;
+                        const px = 5, ph = 14, rx = x + 4, ry = top + 6;
+                        c.fillStyle = color;
+                        c.beginPath();
+                        c.roundRect(rx, ry, tw + px * 2, ph + 2, 3);
+                        c.fill();
+                        c.fillStyle = '#000';
+                        c.fillText(label, rx + px, ry + ph - 2);
+                        c.restore();
+                    });
+                }
+            };
 
             roiHourChart = new Chart(ctx, {
                 type: 'bar',
+                plugins: [changePlugin],
                 data: {
                     labels,
                     datasets: [{
                         label: 'Avg ROI %',
                         data: values,
-                        backgroundColor: colors,
+                        backgroundColor: barColors,
                         borderColor: borderColors,
                         borderWidth: 1,
                     }]
@@ -1068,7 +1113,7 @@ TEMPLATE = '''
                         legend: { display: false },
                         tooltip: {
                             callbacks: {
-                                title: items => labels[items[0].dataIndex] + ' UTC',
+                                title: items => labels[items[0].dataIndex],
                                 label: item => [
                                     ` Avg ROI: ${item.raw >= 0 ? '+' : ''}${item.raw.toFixed(2)}%`,
                                     ` Trades: ${counts[item.dataIndex]}`
@@ -1078,19 +1123,11 @@ TEMPLATE = '''
                     },
                     scales: {
                         y: {
-                            ticks: {
-                                color: '#888',
-                                callback: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
-                            },
+                            ticks: { color: '#888', callback: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%' },
                             grid: { color: '#1f2937' },
                         },
                         x: {
-                            ticks: {
-                                color: '#888',
-                                font: { size: 10 },
-                                autoSkip: true,
-                                maxRotation: 30,
-                            },
+                            ticks: { color: '#888', font: { size: 10 }, autoSkip: true, maxRotation: 30 },
                             grid: { color: '#1f293720' }
                         }
                     }
@@ -1118,7 +1155,7 @@ TEMPLATE = '''
                 renderClosedTrades(paperData.closed_positions);
                 renderChannels(paperData.channels);
                 renderBalanceChart(paperData.balance_history, paperData.filter_change_ts);
-                renderRoiHourChart(paperData.roi_by_hour);
+                renderRoiHourChart(paperData.roi_by_hour, paperData.roi_change_events);
 
             } catch (err) {
                 console.error('Error fetching data:', err);
