@@ -337,24 +337,30 @@ def api_data():
                 'balance': round(running_balance, 2)
             })
 
-    # ROI by hour-of-day (0–23): avg pnl_pct of all trades closed in that hour
+    # ROI per 6-hour bucket (chronological): avg pnl_pct of trades closed in each window
+    BUCKET_HOURS = 6
     _roi_buckets: dict = defaultdict(list)
     for p in closed_positions:
         et = p.get('exit_time', '')
-        if len(et) >= 13:
+        if len(et) >= 16:
             try:
-                hour = int(et[11:13])
-                _roi_buckets[hour].append(p.get('pnl_pct', 0))
-            except ValueError:
+                dt = datetime.fromisoformat(et[:16])  # truncate to minute
+                # Floor to nearest BUCKET_HOURS
+                bucket_h = (dt.day * 24 + dt.hour) // BUCKET_HOURS * BUCKET_HOURS
+                # Use a sortable string key: "YYYY-MM-DD HH:00"
+                bucket_dt = datetime(dt.year, dt.month, dt.day, dt.hour - (dt.hour % BUCKET_HOURS))
+                key = bucket_dt.strftime('%Y-%m-%d %H:%M')
+                _roi_buckets[key].append(p.get('pnl_pct', 0))
+            except (ValueError, OverflowError):
                 pass
-    roi_by_hour = []
-    for h in range(24):
-        pnls = _roi_buckets.get(h, [])
-        roi_by_hour.append({
-            'hour': h,
-            'avg_roi': round(sum(pnls) / len(pnls), 2) if pnls else 0,
-            'count': len(pnls),
-        })
+    roi_by_hour = [
+        {
+            'label': k,
+            'avg_roi': round(sum(v) / len(v), 2),
+            'count': len(v),
+        }
+        for k, v in sorted(_roi_buckets.items())
+    ]
 
     return jsonify({
         'balance': balance,
@@ -662,7 +668,7 @@ TEMPLATE = '''
         </div>
 
         <div class="section">
-            <div class="section-title">&#x23F1; Avg ROI % by Hour of Day <span style="font-size:12px;color:#888;font-weight:normal;margin-left:8px;">UTC — all closed trades</span></div>
+            <div class="section-title">&#x23F1; Avg ROI % per 6-Hour Window <span style="font-size:12px;color:#888;font-weight:normal;margin-left:8px;">UTC — chronological, all closed trades</span></div>
             <div class="chart-container" style="height:220px;">
                 <canvas id="roiHourChart"></canvas>
             </div>
@@ -1028,7 +1034,15 @@ TEMPLATE = '''
             const ctx = document.getElementById('roiHourChart').getContext('2d');
             if (roiHourChart) roiHourChart.destroy();
 
-            const labels = roiByHour.map(d => d.hour.toString().padStart(2,'0') + ':00');
+            // Format "2026-04-13 12:00" → "Apr 13 12:00"
+            function fmtBucket(s) {
+                if (!s) return '';
+                const d = new Date(s.replace(' ', 'T') + ':00Z');
+                return d.toLocaleDateString('en-US', {month:'short', day:'numeric', timeZone:'UTC'})
+                     + ' ' + s.slice(11, 16);
+            }
+
+            const labels = roiByHour.map(d => fmtBucket(d.label));
             const values = roiByHour.map(d => d.avg_roi);
             const counts = roiByHour.map(d => d.count);
             const colors = values.map(v => v >= 0 ? '#10b98199' : '#ef444499');
@@ -1069,10 +1083,14 @@ TEMPLATE = '''
                                 callback: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
                             },
                             grid: { color: '#1f2937' },
-                            border: { dash: [3, 3] }
                         },
                         x: {
-                            ticks: { color: '#888', font: { size: 10 } },
+                            ticks: {
+                                color: '#888',
+                                font: { size: 10 },
+                                autoSkip: true,
+                                maxRotation: 30,
+                            },
                             grid: { color: '#1f293720' }
                         }
                     }
