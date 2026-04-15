@@ -5,11 +5,13 @@ Monitors all signaled memecoins with periodic price snapshots via Dexscreener.
 Tracks contracts for 24h after first signal, then expires them.
 """
 
+import gzip
 import json
 import os
 import sys
 import time
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +21,7 @@ import requests
 BASE_DIR = Path("/home/rob/.openclaw/workspace/autonomous-memecoin-hunter")
 SIGNALS_FILE = BASE_DIR / "logs" / "signals.jsonl"
 SNAPSHOTS_FILE = BASE_DIR / "data" / "price_snapshots.jsonl"
+ARCHIVE_DIR    = BASE_DIR / "data" / "snapshots_archive"
 CYCLE_INTERVAL = 300  # 5 minutes
 TRACK_DURATION = timedelta(hours=24)
 BATCH_SIZE = 30
@@ -29,9 +32,10 @@ DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana/{addresses}"
 EARLY_SNAP_AFTER_S   = 180    # 3 min — don't fetch before token is discoverable
 EARLY_SNAP_TIMEOUT_S = 2400   # 40 min — main cycle takes ~22 min; keep until next check
 
-# Snapshot file rotation: trim entries older than KEEP_DAYS when file exceeds MAX_SIZE_MB
-SNAPSHOT_MAX_SIZE_MB = 400    # trigger trim above 400 MB
-SNAPSHOT_KEEP_DAYS   = 7      # keep 7 days of snapshots (~560 MB at current rate)
+# Archive rotation: entries older than this move to dated gzip archives every 6h.
+# Main file stays ~24h of data; archives accumulate indefinitely for backtesting.
+ARCHIVE_AFTER_HOURS = 24      # move entries older than 24h to daily archive
+ARCHIVE_ROTATE_CYCLES = 72    # rotate every 72 cycles × 5min = 6 hours
 
 # ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -107,19 +111,23 @@ def expire_old_contracts() -> int:
     return len(expired)
 
 
-def trim_old_snapshots() -> None:
-    """Remove snapshot entries older than SNAPSHOT_KEEP_DAYS when file exceeds SNAPSHOT_MAX_SIZE_MB.
-    Rewrites the file atomically via a tmp file. Runs at startup and periodically during operation.
+def rotate_snapshots() -> None:
+    """Move entries older than ARCHIVE_AFTER_HOURS from price_snapshots.jsonl into
+    dated gzip archives under data/snapshots_archive/price_snapshots_YYYY-MM-DD.jsonl.gz.
+
+    Archives accumulate indefinitely — use them for backtesting.
+    Main file stays small (~24h of data).
+    Runs at startup and every ARCHIVE_ROTATE_CYCLES cycles (~6h).
     """
     if not SNAPSHOTS_FILE.exists():
         return
-    size_mb = SNAPSHOTS_FILE.stat().st_size / (1024 * 1024)
-    if size_mb < SNAPSHOT_MAX_SIZE_MB:
-        return
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)).isoformat()
-    kept = []
-    dropped = 0
+    cutoff_str = (datetime.now(timezone.utc) - timedelta(hours=ARCHIVE_AFTER_HOURS)).isoformat()
+    size_mb = SNAPSHOTS_FILE.stat().st_size / (1024 * 1024)
+
+    keep: list[str] = []
+    archive_by_date: dict[str, list[str]] = defaultdict(list)
+
     with open(SNAPSHOTS_FILE) as f:
         for line in f:
             line = line.strip()
@@ -127,23 +135,40 @@ def trim_old_snapshots() -> None:
                 continue
             try:
                 snap = json.loads(line)
-                if snap.get("timestamp", "") >= cutoff:
-                    kept.append(line)
+                ts = snap.get("timestamp", "")
+                if ts < cutoff_str:
+                    date_key = ts[:10]  # YYYY-MM-DD
+                    archive_by_date[date_key].append(line)
                 else:
-                    dropped += 1
+                    keep.append(line)
             except json.JSONDecodeError:
-                pass  # drop malformed lines silently
+                pass  # drop malformed lines
 
+    if not archive_by_date:
+        return  # nothing old enough to archive
+
+    # Append to dated gzip archives (create or extend)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    for date_key, lines in sorted(archive_by_date.items()):
+        archive_path = ARCHIVE_DIR / f"price_snapshots_{date_key}.jsonl.gz"
+        mode = "ab" if archive_path.exists() else "wb"
+        with gzip.open(archive_path, mode) as gz:
+            for line in lines:
+                gz.write((line + "\n").encode())
+
+    # Rewrite main file with only recent entries
     tmp = SNAPSHOTS_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
-        for line in kept:
+        for line in keep:
             f.write(line + "\n")
     tmp.rename(SNAPSHOTS_FILE)
 
     new_mb = SNAPSHOTS_FILE.stat().st_size / (1024 * 1024)
+    archived_total = sum(len(v) for v in archive_by_date.values())
+    archive_files = ", ".join(sorted(archive_by_date.keys()))
     log.info(
-        "Snapshot trim: %.0f MB → %.0f MB (%d entries dropped, %d kept, %d-day window)",
-        size_mb, new_mb, dropped, len(kept), SNAPSHOT_KEEP_DAYS,
+        "Snapshot rotate: %.0f MB → %.0f MB | %d entries archived to [%s] | %d entries kept",
+        size_mb, new_mb, archived_total, archive_files, len(keep),
     )
 
 
@@ -339,8 +364,8 @@ def main():
     # Ensure data dir exists
     SNAPSHOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    # Trim stale snapshots at startup (file can grow to ~79 MB/day; trim to 7-day window)
-    trim_old_snapshots()
+    # Rotate old snapshots into dated archives at startup
+    rotate_snapshots()
 
     # Initial load
     new = load_signals(initial=True)
@@ -351,9 +376,9 @@ def main():
     while True:
         cycles += 1
         try:
-            # Periodic snapshot trim: once every 288 cycles (~24h at 5-min intervals)
-            if cycles % 288 == 0:
-                trim_old_snapshots()
+            # Periodic archive rotation: every 72 cycles (~6h at 5-min intervals)
+            if cycles % ARCHIVE_ROTATE_CYCLES == 0:
+                rotate_snapshots()
 
             # Check for new signals
             new_signals = load_signals(initial=False)
